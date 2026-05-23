@@ -277,10 +277,10 @@ def test_smtp_connection() -> str | None:
     try:
         if smtp.get("ssl", True):
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx) as server:
+            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx, timeout=10) as server:
                 server.login(smtp["user"], smtp["password"])
         else:
-            with smtplib.SMTP(smtp["host"], smtp["port"]) as server:
+            with smtplib.SMTP(smtp["host"], smtp["port"], timeout=10) as server:
                 server.starttls()
                 server.login(smtp["user"], smtp["password"])
         return None
