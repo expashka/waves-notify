@@ -721,6 +721,33 @@ async def notify_handler(request: web.Request):
 
     return web.json_response({"ok": True, "tg_sent": tg_sent, "errors": errors})
 
+async def cookie_consent_handler(request: web.Request):
+    """Accepts cookie consent events — saves to file, returns 200. No notifications."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": False, "error": "invalid_payload"}, status=400)
+    decision = safe(payload.get("decision"), 16)
+    if decision not in ("accepted", "declined"):
+        return web.json_response({"ok": False, "error": "invalid_decision"}, status=400)
+    entry = {
+        "decision":          decision,
+        "client_ts":         safe(payload.get("ts"), 64),
+        "page":              safe(payload.get("page"), 500),
+        "received_at":       datetime.now(timezone.utc).isoformat(),
+        "ip":                request.headers.get("X-Real-IP", request.remote or ""),
+    }
+    consents_file = LEADS_FILE.parent / "cookie_consents.jsonl"
+    try:
+        consents_file.parent.mkdir(parents=True, exist_ok=True)
+        with consents_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"cookie consent save error: {exc}", flush=True)
+    return web.json_response({"ok": True})
+
 async def health_handler(_: web.Request):
     return web.json_response({
         "ok":         True,
@@ -762,6 +789,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", health_handler)
     app.router.add_post("/lead", lead_handler)
     app.router.add_post("/notify", notify_handler)
+    app.router.add_post("/cookie-consent", cookie_consent_handler)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
