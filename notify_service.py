@@ -99,12 +99,15 @@ EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))  # seconds
 bot: Any = None
 _polling_task: asyncio.Task | None = None
 
-if AIOGRAM_AVAILABLE and TG_BOT_TOKEN:
-    bot = Bot(TG_BOT_TOKEN)
-elif not TG_BOT_TOKEN:
+if not TG_BOT_TOKEN:
     print("⚠  TG_BOT_TOKEN not set — Telegram disabled", flush=True)
 elif not AIOGRAM_AVAILABLE:
     print("⚠  aiogram not installed — Telegram disabled", flush=True)
+else:
+    try:
+        bot = Bot(TG_BOT_TOKEN)
+    except Exception as e:
+        print(f"⚠  Invalid TG_BOT_TOKEN — Telegram disabled: {e}", flush=True)
 
 
 # ───────────── helpers ─────────────
