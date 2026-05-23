@@ -1,29 +1,88 @@
 # waves-notify
 
-Universal lead notification service. Receives form submissions via HTTP and forwards them to **Telegram** and/or **Email**. Both channels are optional and independent.
+Универсальный сервис уведомлений для лендингов. Принимает заявки с форм по HTTP и отправляет их в **Telegram** и/или **Email**. Оба канала независимы и опциональны.
 
-## Endpoints
+---
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/lead` | Receive a lead from any form |
-| `POST` | `/notify` | Send arbitrary text notification (requires `NOTIFY_SECRET` token) |
-| `GET` | `/health` | Service health |
+## Быстрый старт
 
-### POST /lead
-
-```json
-{
-  "name":    "Ivan",
-  "contact": "+7 900 000 00 00",
-  "email":   "ivan@example.com",
-  "message": "Optional message",
-  "consent": true,
-  "page":    "https://example.com/landing"
-}
+```bash
+git clone https://github.com/expashka/waves-notify.git
+cd waves-notify
+cp .env.example .env
+# заполни TG_BOT_TOKEN и/или SMTP в .env
+docker compose up -d
 ```
 
-Only `consent: true` is required. At least one of `name`, `contact`, or `email` must be present.
+---
+
+## Подключение формы
+
+С фронтенда отправь `POST /lead`:
+
+```js
+await fetch('https://your-domain.ru/lead', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    name:    'Иван',
+    contact: '+7 900 000 00 00',
+    email:   'ivan@example.com',
+    message: 'Комментарий',
+    consent: true,
+    page:    location.href,
+  }),
+})
+```
+
+Обязательно только `consent: true` и хотя бы одно из полей `name`, `contact`, `email`.
+
+---
+
+## Telegram-бот
+
+### Первоначальная настройка
+
+1. Создай бота через [@BotFather](https://t.me/BotFather), скопируй токен
+2. Запиши в `.env`:
+   ```
+   TG_BOT_TOKEN=123456789:AAG...
+   TG_ADMIN_CHAT_ID=твой_chat_id
+   ```
+3. Свой `chat_id` можно узнать — напиши боту `/start`, затем `/chat_id`
+
+### Управление получателями через бота
+
+Все действия — через кнопки, без ввода ID вручную.
+
+| Кнопка | Действие |
+|--------|----------|
+| 👥 Получатели | Список получателей. Тап на имя открывает карточку |
+| ➕ Добавить | Добавить получателя по `chat_id` |
+| ➖ Удалить | Выбрать из списка → подтвердить удаление |
+| 📧 Добавить email | Выбрать получателя → ввести email → получить код на почту → подтвердить |
+| ⚙️ Настройки | Настройка SMTP прямо из бота |
+| 🆔 Мой ID | Показать свой `chat_id` |
+
+### Подключение сотрудника
+
+1. Сотрудник пишет боту `/start` → нажимает **🔔 Запросить уведомления**
+2. Администратор получает запрос → нажимает **✅ Подключить**
+3. Опционально: admin предлагает email → сотрудник вводит адрес → получает код на почту → вводит код → email подключён
+
+### Настройка SMTP через бота
+
+Идёт в **⚙️ Настройки** → выбирает провайдера (Яндекс / Mail.ru / Gmail / свой сервер) → вводит логин и пароль приложения → бот проверяет соединение и сохраняет.
+
+---
+
+## API
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `POST` | `/lead` | Принять заявку с формы |
+| `POST` | `/notify` | Отправить произвольный текст (требует `NOTIFY_SECRET`) |
+| `GET` | `/health` | Статус сервиса |
 
 ### POST /notify
 
@@ -32,42 +91,45 @@ POST /notify
 X-Notify-Token: <NOTIFY_SECRET>
 Content-Type: application/json
 
-{ "text": "Deploy finished ✓" }
+{ "text": "Деплой завершён ✓" }
 ```
 
-Optionally send to a specific Telegram chat:
+Можно отправить конкретному пользователю:
 ```json
-{ "text": "hello", "chat_id": "123456789" }
+{ "text": "Привет", "chat_id": "123456789" }
 ```
 
-## Quick start
+---
 
-```bash
-cp .env.example .env
-# fill in TG_BOT_TOKEN and/or SMTP_* in .env
-docker compose up -d
-```
+## Переменные окружения
 
-## Connecting a form
+| Переменная | Обязательно | Описание |
+|------------|:-----------:|----------|
+| `TG_BOT_TOKEN` | — | Токен Telegram-бота |
+| `TG_ADMIN_CHAT_ID` | — | `chat_id` администратора |
+| `TG_SUPER_ADMIN_IDS` | — | Дополнительные admin ID через запятую |
+| `TG_POLLING_ENABLED` | — | `1` (по умолчанию) — включить polling |
+| `SITE_NAME` | — | Название сайта в уведомлениях |
+| `PORT` | — | Порт сервиса (по умолчанию `8080`) |
+| `NOTIFY_SECRET` | — | Токен для защиты `/notify` |
+| `LEADS_FILE` | — | Путь к файлу заявок (по умолчанию `/data/leads.jsonl`) |
+| `RECIPIENTS_FILE` | — | Путь к файлу получателей (по умолчанию `/data/recipients.json`) |
+| `SMTP_FILE` | — | Путь к файлу SMTP-настроек (по умолчанию `/data/smtp.json`) |
+| `SMTP_PROVIDER` | — | Пресет: `yandex`, `mailru`, `gmail` |
+| `SMTP_USER` | — | Логин (email отправителя) |
+| `SMTP_PASSWORD` | — | Пароль приложения |
+| `SMTP_FROM` | — | Адрес отправителя (если отличается от логина) |
+| `SMTP_TO` | — | Дополнительные email получателей через запятую |
 
-From your frontend, send a `POST` request to `/lead`:
+SMTP можно настроить полностью через бота — тогда файл `.env` трогать не нужно.
 
-```js
-await fetch('http://your-server:8080/lead', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ name, contact, email, message, consent: true, page: location.href }),
-})
-```
+---
 
-## Telegram bot
+## Данные
 
-1. Create a bot via [@BotFather](https://t.me/BotFather), copy the token to `TG_BOT_TOKEN`
-2. Get your `chat_id`: start the bot and send `/chat_id`
-3. Set `TG_ADMIN_CHAT_ID` to your chat_id
+Все данные хранятся в папке `./data/`:
 
-Admin commands: `/notify_list`, `/add_notify <id>`, `/remove_notify <id>`
-
-## Environment variables
-
-See [`.env.example`](.env.example) for all options.
+- `leads.jsonl` — заявки с форм
+- `recipients.json` — список получателей уведомлений
+- `smtp.json` — настройки SMTP (если настраивались через бота)
+- `cookie_consents.jsonl` — согласия с cookie-политикой
