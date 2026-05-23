@@ -359,6 +359,29 @@ def kb_cancel_input() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input")
     ]])
 
+def kb_recipients_list(recipients: list[dict], action: str) -> InlineKeyboardMarkup:
+    rows = []
+    for r in recipients:
+        label = display_name(r)[:40]
+        cid = str(r.get("telegram_id", ""))
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"recipient:{action}:{cid}")])
+    rows.append([InlineKeyboardButton(text="◀️ Закрыть", callback_data="recipient:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_recipient_card(telegram_id: str, has_email: bool) -> InlineKeyboardMarkup:
+    email_label = "📧 Изменить email" if has_email else "📧 Добавить email"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=email_label, callback_data=f"recipient:add_email:{telegram_id}")],
+        [InlineKeyboardButton(text="➖ Удалить", callback_data=f"recipient:delete:{telegram_id}")],
+        [InlineKeyboardButton(text="◀️ К списку", callback_data="recipient:list")],
+    ])
+
+def kb_recipient_delete_confirm(telegram_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"recipient:delete_confirm:{telegram_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"recipient:view:{telegram_id}"),
+    ]])
+
 def kb_resend_code(email: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔄 Отправить код снова", callback_data="user:resend_code"),
@@ -507,53 +530,76 @@ async def handle_tg_message(message: dict):
             pass
         return
 
-    elif waiting == "remove_chat_id" and is_admin:
-        target = normalize_chat_id(text)
-        if not target:
-            await bot.send_message(chat_id, "Неверный формат:", reply_markup=kb_cancel_input())
-            return
-        _waiting_input.pop(chat_id, None)
-        remove_recipient(target)
-        await bot.send_message(chat_id, f"Удалён получатель с ID: {target}", reply_markup=kb_admin_main())
-        try:
-            await bot.send_message(target, f"ℹ️ Вы удалены из рассылки {SITE_NAME}.")
-        except Exception:
-            pass
-        return
-
-    elif waiting == "admin_email_chat_id" and is_admin:
-        target = normalize_chat_id(text)
-        if not target:
-            await bot.send_message(chat_id, "Неверный chat_id. Попробуйте ещё раз:", reply_markup=kb_cancel_input())
-            return
-        _waiting_input[chat_id] = "admin_email_value"
-        _admin_email_target[chat_id] = target
-        # Show name if recipient exists
-        r = find_recipient(target)
-        hint = f" ({display_name(r)})" if r else f" (ID: {target})"
-        await bot.send_message(chat_id, f"Введите email для получателя{hint}:", reply_markup=kb_cancel_input())
-        return
-
     elif waiting == "admin_email_value" and is_admin:
         email = text.strip()
         if not is_valid_email(email):
             await bot.send_message(chat_id, "❌ Некорректный email. Попробуйте ещё раз:", reply_markup=kb_cancel_input())
             return
+        if not _admin_email_target.get(chat_id):
+            await bot.send_message(chat_id, "Сессия истекла.", reply_markup=kb_admin_main())
+            _waiting_input.pop(chat_id, None)
+            return
+        await bot.send_message(chat_id, f"⏳ Отправляю код подтверждения на {email}…")
+        ok = await send_confirmation_code(chat_id, email)
+        if not ok:
+            _waiting_input.pop(chat_id, None)
+            _admin_email_target.pop(chat_id, None)
+            await bot.send_message(
+                chat_id,
+                "❌ Не удалось отправить письмо. Проверьте адрес или настройки SMTP.",
+                reply_markup=kb_admin_main(),
+            )
+            return
+        _waiting_input[chat_id] = "admin_email_code"
+        await bot.send_message(
+            chat_id,
+            f"📬 Код отправлен на {email}.\n\nВведите 6-значный код из письма:",
+            reply_markup=kb_resend_code(email),
+        )
+        return
+
+    elif waiting == "admin_email_code" and is_admin:
+        pending = _pending_email.get(chat_id)
+        if not pending:
+            _waiting_input.pop(chat_id, None)
+            _admin_email_target.pop(chat_id, None)
+            await bot.send_message(chat_id, "Сессия истекла. Начните заново.", reply_markup=kb_admin_main())
+            return
+        if datetime.now(timezone.utc).timestamp() > pending["expires"]:
+            _waiting_input.pop(chat_id, None)
+            _pending_email.pop(chat_id, None)
+            _admin_email_target.pop(chat_id, None)
+            await bot.send_message(chat_id, "⏰ Код устарел. Начните заново.", reply_markup=kb_admin_main())
+            return
+        if text.strip() != pending["code"]:
+            await bot.send_message(
+                chat_id,
+                "❌ Неверный код. Попробуйте ещё раз:",
+                reply_markup=kb_resend_code(pending["email"]),
+            )
+            return
+        email = pending["email"]
         target = _admin_email_target.pop(chat_id, None)
         _waiting_input.pop(chat_id, None)
+        _pending_email.pop(chat_id, None)
         if not target:
             await bot.send_message(chat_id, "Сессия истекла.", reply_markup=kb_admin_main())
             return
-        r = find_recipient(target)
-        if r:
-            r["email"] = email
-            if "email" not in r.get("channels", []):
-                r.setdefault("channels", []).append("email")
-            save_recipients(load_recipients())
+        recipients = load_recipients()
+        found = False
+        for rec in recipients:
+            if str(rec.get("telegram_id", "")) == target:
+                rec["email"] = email
+                if "email" not in rec.get("channels", []):
+                    rec.setdefault("channels", []).append("email")
+                found = True
+                break
+        if found:
+            save_recipients(recipients)
         else:
             upsert_recipient(target, email=email, channels=["telegram", "email"])
         label = display_name(find_recipient(target) or {"telegram_id": target})
-        await bot.send_message(chat_id, f"✅ Email {email} добавлен для {label}", reply_markup=kb_admin_main())
+        await bot.send_message(chat_id, f"✅ Email {email} подтверждён и добавлен для {label}", reply_markup=kb_admin_main())
         try:
             await bot.send_message(target, f"📧 Администратор подключил email-уведомления: {email}")
         except Exception:
@@ -650,7 +696,11 @@ async def handle_tg_message(message: dict):
         return
 
     if text == "👥 Получатели":
-        await bot.send_message(chat_id, await format_recipients_list())
+        recipients = load_recipients()
+        if not recipients:
+            await bot.send_message(chat_id, "Список получателей пуст.")
+        else:
+            await bot.send_message(chat_id, f"👥 Получателей: {len(recipients)}", reply_markup=kb_recipients_list(recipients, "view"))
         return
 
     if text == "➕ Добавить":
@@ -659,13 +709,19 @@ async def handle_tg_message(message: dict):
         return
 
     if text == "➖ Удалить":
-        _waiting_input[chat_id] = "remove_chat_id"
-        await bot.send_message(chat_id, "Введите chat_id для удаления:", reply_markup=kb_cancel_input())
+        recipients = load_recipients()
+        if not recipients:
+            await bot.send_message(chat_id, "Список получателей пуст.")
+        else:
+            await bot.send_message(chat_id, "Выберите получателя для удаления:", reply_markup=kb_recipients_list(recipients, "delete"))
         return
 
     if text == "📧 Добавить email":
-        _waiting_input[chat_id] = "admin_email_chat_id"
-        await bot.send_message(chat_id, "Введите chat_id получателя, которому хотите добавить email:", reply_markup=kb_cancel_input())
+        recipients = load_recipients()
+        if not recipients:
+            await bot.send_message(chat_id, "Список получателей пуст.")
+        else:
+            await bot.send_message(chat_id, "Выберите получателя:", reply_markup=kb_recipients_list(recipients, "add_email"))
         return
 
     if text == "⚙️ Настройки":
@@ -800,6 +856,103 @@ async def handle_tg_callback(callback: dict):
             await bot.answer_callback_query(callback_id, text="Код отправлен повторно.")
         else:
             await bot.answer_callback_query(callback_id, text="Не удалось отправить письмо.", show_alert=True)
+        return
+
+    # ── recipient card actions ──
+    if data.startswith("recipient:"):
+        if not is_admin:
+            await bot.answer_callback_query(callback_id, text="Нет доступа.", show_alert=True)
+            return
+        await bot.answer_callback_query(callback_id)
+        rparts = data.split(":", 2)
+        raction = rparts[1] if len(rparts) > 1 else ""
+        rtarget = rparts[2] if len(rparts) > 2 else ""
+
+        async def _recipients_list_msg():
+            recipients = load_recipients()
+            try:
+                await bot.edit_message_text(
+                    f"👥 Получателей: {len(recipients)}",
+                    chat_id=chat_id, message_id=message_id,
+                    reply_markup=kb_recipients_list(recipients, "view") if recipients else None,
+                )
+            except Exception:
+                pass
+
+        def _recipient_card_text(r: dict) -> str:
+            lines = [f"👤 {display_name(r)}", f"ID: {r.get('telegram_id', '')}"]
+            channels = []
+            if "telegram" in r.get("channels", []):
+                channels.append("Telegram")
+            if "email" in r.get("channels", []):
+                channels.append(f"✉️ {r.get('email', '')}")
+            lines.append("Каналы: " + (" · ".join(channels) if channels else "нет"))
+            return "\n".join(lines)
+
+        if raction == "close":
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                pass
+            return
+
+        if raction == "list":
+            await _recipients_list_msg()
+            return
+
+        if raction == "view":
+            r = find_recipient(rtarget)
+            if not r:
+                await bot.edit_message_text("Получатель не найден.", chat_id=chat_id, message_id=message_id)
+                return
+            try:
+                await bot.edit_message_text(
+                    _recipient_card_text(r),
+                    chat_id=chat_id, message_id=message_id,
+                    reply_markup=kb_recipient_card(rtarget, bool(r.get("email"))),
+                )
+            except Exception:
+                pass
+            return
+
+        if raction == "delete":
+            r = find_recipient(rtarget)
+            name = display_name(r) if r else f"ID: {rtarget}"
+            try:
+                await bot.edit_message_text(
+                    f"Удалить получателя?\n\n👤 {name}",
+                    chat_id=chat_id, message_id=message_id,
+                    reply_markup=kb_recipient_delete_confirm(rtarget),
+                )
+            except Exception:
+                pass
+            return
+
+        if raction == "delete_confirm":
+            r = find_recipient(rtarget)
+            name = display_name(r) if r else f"ID: {rtarget}"
+            remove_recipient(rtarget)
+            try:
+                await bot.edit_message_text(
+                    f"✅ Удалён: {name}",
+                    chat_id=chat_id, message_id=message_id,
+                )
+            except Exception:
+                pass
+            try:
+                await bot.send_message(rtarget, f"ℹ️ Вы удалены из рассылки {SITE_NAME}.")
+            except Exception:
+                pass
+            return
+
+        if raction == "add_email":
+            r = find_recipient(rtarget)
+            hint = display_name(r) if r else f"ID: {rtarget}"
+            _waiting_input[chat_id] = "admin_email_value"
+            _admin_email_target[chat_id] = rtarget
+            await bot.send_message(chat_id, f"Введите email для получателя ({hint}):", reply_markup=kb_cancel_input())
+            return
+
         return
 
     # ── admin actions ──
