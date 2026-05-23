@@ -1,0 +1,2 @@
+aiohttp>=3.9
+aiogram>=3.0
