@@ -69,14 +69,23 @@ TG_RECIPIENTS_FILE    = Path(os.getenv("TG_RECIPIENTS_FILE") or "/data/tg_recipi
 if TG_ADMIN_CHAT_ID:
     TG_SUPER_ADMIN_IDS.add(TG_ADMIN_CHAT_ID)
 
-# Email
-SMTP_HOST     = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "465"))
+# Email — provider presets (host, port, ssl)
+_SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
+    "yandex": ("smtp.yandex.ru",  465, True),
+    "mailru":  ("smtp.mail.ru",    465, True),
+    "gmail":   ("smtp.gmail.com",  465, True),
+}
+
 SMTP_USER     = os.getenv("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER).strip()
 SMTP_TO       = _parse_ids(os.getenv("SMTP_TO", ""))
-SMTP_SSL      = os.getenv("SMTP_SSL", "1").strip() != "0"
+
+_provider = os.getenv("SMTP_PROVIDER", "").strip().lower()
+_preset = _SMTP_PRESETS.get(_provider, ("", 465, True))
+SMTP_HOST = os.getenv("SMTP_HOST", _preset[0]).strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", str(_preset[1])))
+SMTP_SSL  = os.getenv("SMTP_SSL", "1" if _preset[2] else "0").strip() != "0"
 
 # General
 NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "").strip()
