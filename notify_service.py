@@ -7,13 +7,20 @@ Endpoints:
   POST /lead      — receive form submission, save to JSONL, notify all channels
   POST /notify    — send arbitrary text (internal use, requires NOTIFY_SECRET token)
   GET  /health    — service health
+
+Bot flow:
+  Staff:  /start → request notifications → admin approves TG → admin requests email
+          → staff enters email → receives confirmation code → enters code → done
+  Admin:  approve/decline join requests, request email from staff, manage recipients
 """
 
 import asyncio
 import json
 import os
+import random
 import smtplib
 import ssl
+import string
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -55,23 +62,20 @@ _load_env_file()
 def _parse_ids(value: str) -> set[str]:
     return {s.strip() for s in value.replace(";", ",").split(",") if s.strip()}
 
-# General
 SITE_NAME     = os.getenv("SITE_NAME", "waves-notify").strip()
 PORT          = int(os.getenv("PORT", "8080"))
 NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "").strip()
 LEADS_FILE    = Path(os.getenv("LEADS_FILE") or "/data/leads.jsonl")
 
-# Telegram
 TG_BOT_TOKEN       = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_ADMIN_CHAT_ID   = os.getenv("TG_ADMIN_CHAT_ID", "").strip()
 TG_SUPER_ADMIN_IDS = _parse_ids(os.getenv("TG_SUPER_ADMIN_IDS", ""))
 TG_POLLING_ENABLED = os.getenv("TG_POLLING_ENABLED", "1").strip() != "0"
-TG_RECIPIENTS_FILE = Path(os.getenv("TG_RECIPIENTS_FILE") or "/data/tg_recipients.json")
+RECIPIENTS_FILE    = Path(os.getenv("RECIPIENTS_FILE") or "/data/recipients.json")
 
 if TG_ADMIN_CHAT_ID:
     TG_SUPER_ADMIN_IDS.add(TG_ADMIN_CHAT_ID)
 
-# Email — provider presets (host, port, ssl)
 _SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
     "yandex": ("smtp.yandex.ru", 465, True),
     "mailru":  ("smtp.mail.ru",   465, True),
@@ -80,19 +84,20 @@ _SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
 SMTP_USER     = os.getenv("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER).strip()
-SMTP_TO       = _parse_ids(os.getenv("SMTP_TO", ""))
+SMTP_TO_EXTRA = _parse_ids(os.getenv("SMTP_TO", ""))  # fixed extra recipients
 _provider     = os.getenv("SMTP_PROVIDER", "").strip().lower()
 _preset       = _SMTP_PRESETS.get(_provider, ("", 465, True))
 SMTP_HOST     = os.getenv("SMTP_HOST", _preset[0]).strip()
 SMTP_PORT     = int(os.getenv("SMTP_PORT", str(_preset[1])))
 SMTP_SSL      = os.getenv("SMTP_SSL", "1" if _preset[2] else "0").strip() != "0"
 
+EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))  # seconds
+
 
 # ───────────── Telegram setup ─────────────
 
 bot: Any = None
 _polling_task: asyncio.Task | None = None
-_admin_pending_actions: dict[str, str] = {}  # chat_id → "add" | "remove"
 
 if AIOGRAM_AVAILABLE and TG_BOT_TOKEN:
     bot = Bot(TG_BOT_TOKEN)
@@ -118,105 +123,182 @@ def normalize_chat_id(value: str) -> str:
         return text if text[1:].isdigit() else ""
     return text if text.isdigit() else ""
 
-def user_label(message: dict) -> str:
-    user = message.get("from") or message.get("from_user") or {}
-    name = " ".join(filter(None, [
-        str(user.get("first_name") or "").strip(),
-        str(user.get("last_name") or "").strip(),
-    ])).strip()
-    username = str(user.get("username") or "").strip()
-    chat_id = str((message.get("chat") or {}).get("id") or "")
+def is_valid_email(value: str) -> bool:
+    import re
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value.strip()))
+
+def generate_code() -> str:
+    return "".join(random.choices(string.digits, k=6))
+
+def display_name(r: dict) -> str:
+    name = r.get("name") or ""
+    username = r.get("username") or ""
     parts = [name or "Без имени"]
     if username:
         parts.append(f"@{username}")
-    parts.append(f"ID: {chat_id}")
     return " · ".join(parts)
 
 
-# ───────────── recipients ─────────────
+# ───────────── recipients storage ─────────────
+# Format: list of dicts
+# { "telegram_id": "123", "name": "Ivan", "username": "ivan", "email": "ivan@mail.ru",
+#   "channels": ["telegram", "email"] }
 
-def load_recipients() -> set[str]:
-    recipients = set()
-    if TG_ADMIN_CHAT_ID:
-        recipients.add(TG_ADMIN_CHAT_ID)
+def load_recipients() -> list[dict]:
     try:
-        if TG_RECIPIENTS_FILE.exists():
-            data = json.loads(TG_RECIPIENTS_FILE.read_text(encoding="utf-8"))
+        if RECIPIENTS_FILE.exists():
+            data = json.loads(RECIPIENTS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                recipients.update(str(x).strip() for x in data if str(x).strip())
+                return data
     except Exception:
         pass
-    return recipients
+    return []
 
-def save_recipients(recipients: set[str]):
-    TG_RECIPIENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TG_RECIPIENTS_FILE.write_text(
-        json.dumps(sorted(recipients), ensure_ascii=False, indent=2),
+def save_recipients(recipients: list[dict]):
+    RECIPIENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RECIPIENTS_FILE.write_text(
+        json.dumps(recipients, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
+def find_recipient(telegram_id: str) -> dict | None:
+    for r in load_recipients():
+        if str(r.get("telegram_id") or "") == telegram_id:
+            return r
+    return None
 
-# ───────────── email ─────────────
+def upsert_recipient(telegram_id: str, **fields):
+    recipients = load_recipients()
+    for r in recipients:
+        if str(r.get("telegram_id") or "") == telegram_id:
+            r.update(fields)
+            save_recipients(recipients)
+            return
+    entry: dict = {"telegram_id": telegram_id, "channels": ["telegram"], **fields}
+    recipients.append(entry)
+    save_recipients(recipients)
 
-def send_email(subject: str, body: str) -> list[str]:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SMTP_TO):
+def remove_recipient(telegram_id: str):
+    recipients = [r for r in load_recipients() if str(r.get("telegram_id") or "") != telegram_id]
+    save_recipients(recipients)
+
+def tg_chat_ids_for_leads() -> list[str]:
+    ids = []
+    for r in load_recipients():
+        if "telegram" in r.get("channels", []) and r.get("telegram_id"):
+            ids.append(str(r["telegram_id"]))
+    # also include admins
+    for aid in sorted(TG_SUPER_ADMIN_IDS):
+        if aid not in ids:
+            ids.append(aid)
+    return ids
+
+def email_addresses_for_leads() -> list[str]:
+    emails = list(SMTP_TO_EXTRA)
+    for r in load_recipients():
+        if "email" in r.get("channels", []) and r.get("email"):
+            em = str(r["email"]).strip()
+            if em and em not in emails:
+                emails.append(em)
+    return emails
+
+
+# ───────────── pending email confirmations ─────────────
+# chat_id → { "email": str, "code": str, "expires": float }
+_pending_email: dict[str, dict] = {}
+
+# chat_id → what we're waiting for: "email_input"
+_waiting_input: dict[str, str] = {}
+
+
+# ───────────── email sending ─────────────
+
+def send_email(to: list[str], subject: str, body: str) -> list[str]:
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or not to:
         return []
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = SMTP_FROM
-    msg["To"] = ", ".join(sorted(SMTP_TO))
+    msg["To"] = ", ".join(to)
     try:
         if SMTP_SSL:
             ctx = ssl.create_default_context()
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as server:
                 server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, list(SMTP_TO), msg.as_string())
+                server.sendmail(SMTP_FROM, to, msg.as_string())
         else:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
                 server.starttls()
                 server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, list(SMTP_TO), msg.as_string())
+                server.sendmail(SMTP_FROM, to, msg.as_string())
     except Exception as exc:
         print(f"email error: {exc}", flush=True)
         return [str(exc)]
     return []
 
-async def send_email_async(subject: str, body: str) -> list[str]:
-    return await asyncio.get_event_loop().run_in_executor(None, send_email, subject, body)
+async def send_email_async(to: list[str], subject: str, body: str) -> list[str]:
+    return await asyncio.get_event_loop().run_in_executor(None, send_email, to, subject, body)
+
+async def send_confirmation_code(chat_id: str, email: str) -> bool:
+    code = generate_code()
+    _pending_email[chat_id] = {
+        "email": email,
+        "code": code,
+        "expires": datetime.now(timezone.utc).timestamp() + EMAIL_CODE_TTL,
+    }
+    subject = f"Подтверждение email — {SITE_NAME}"
+    body = (
+        f"Ваш код подтверждения: {code}\n\n"
+        f"Введите его в Telegram-боте {SITE_NAME}.\n"
+        f"Код действителен {EMAIL_CODE_TTL // 60} минут."
+    )
+    errors = await send_email_async([email], subject, body)
+    return len(errors) == 0
 
 
 # ───────────── Telegram keyboards ─────────────
 
-def _kb_user_start() -> InlineKeyboardMarkup:
+def kb_user_start() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔔 Подключить уведомления", callback_data="user:request")
+        InlineKeyboardButton(text="🔔 Запросить уведомления", callback_data="user:request")
     ]])
 
-def _kb_admin_request(requester_id: str) -> InlineKeyboardMarkup:
+def kb_admin_join_request(requester_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Подключить", callback_data=f"admin:approve:{requester_id}"),
-        InlineKeyboardButton(text="❌ Отклонить",  callback_data=f"admin:decline:{requester_id}"),
+        InlineKeyboardButton(text="✅ Подключить",  callback_data=f"admin:approve:{requester_id}"),
+        InlineKeyboardButton(text="❌ Отклонить",   callback_data=f"admin:decline:{requester_id}"),
     ]])
 
-def _kb_admin_main() -> ReplyKeyboardMarkup:
+def kb_admin_after_approve(telegram_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📧 Запросить email", callback_data=f"admin:request_email:{telegram_id}"),
+    ]])
+
+def kb_admin_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👥 Список рассылки")],
+            [KeyboardButton(text="👥 Получатели")],
             [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="➖ Удалить")],
             [KeyboardButton(text="🆔 Мой ID")],
         ],
         resize_keyboard=True,
     )
 
-def _kb_cancel() -> InlineKeyboardMarkup:
+def kb_cancel_input() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Отмена", callback_data="admin:cancel_input")
+        InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input")
     ]])
 
-ADMIN_BUTTONS = {"👥 Список рассылки", "➕ Добавить", "➖ Удалить", "🆔 Мой ID"}
+def kb_resend_code(email: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Отправить код снова", callback_data="user:resend_code"),
+        InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input"),
+    ]])
+
+ADMIN_BUTTONS = {"👥 Получатели", "➕ Добавить", "➖ Удалить", "🆔 Мой ID"}
 
 
-# ───────────── Telegram messaging ─────────────
+# ───────────── Telegram broadcast ─────────────
 
 async def tg_broadcast(text: str, chat_ids: list[str]):
     if not bot:
@@ -227,113 +309,185 @@ async def tg_broadcast(text: str, chat_ids: list[str]):
         except Exception as exc:
             print(f"tg send error {chat_id}: {exc}", flush=True)
 
-async def _format_recipients_list(recipients: set[str]) -> str:
+async def format_recipients_list() -> str:
+    recipients = load_recipients()
     if not recipients:
-        return "Список рассылки пуст."
-    lines = ["Получают уведомления:"]
-    for chat_id in sorted(recipients):
-        label = ""
-        try:
-            chat = await bot.get_chat(chat_id)
-            if getattr(chat, "username", None):
-                label = f"@{chat.username}"
-            elif getattr(chat, "first_name", None):
-                label = str(chat.first_name)
-            elif getattr(chat, "title", None):
-                label = str(chat.title)
-        except Exception:
-            pass
-        lines.append(f"• {label or 'Пользователь'} (ID: {chat_id})")
+        return "Список получателей пуст."
+    lines = [f"Получателей: {len(recipients)}\n"]
+    for r in recipients:
+        name = display_name(r)
+        channels = []
+        if "telegram" in r.get("channels", []):
+            channels.append("TG")
+        if "email" in r.get("channels", []):
+            channels.append(f"✉️ {r.get('email', '')}")
+        ch_str = " · ".join(channels) if channels else "нет каналов"
+        lines.append(f"• {name}\n  {ch_str}")
     return "\n".join(lines)
 
 
 # ───────────── Telegram message handler ─────────────
 
 async def handle_tg_message(message: dict):
-    chat_id = str((message.get("chat") or {}).get("id") or "")
-    text = str(message.get("text") or "").strip()
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+    chat_id   = str(chat.get("id") or "")
+    text      = str(message.get("text") or "").strip()
+    is_admin  = chat_id in TG_SUPER_ADMIN_IDS
+
     if not chat_id or not text:
         return
 
-    is_admin = chat_id in TG_SUPER_ADMIN_IDS
-    pending = _admin_pending_actions.get(chat_id)
+    # ── handle pending input (email or chat_id) ──
+    waiting = _waiting_input.get(chat_id)
 
-    # Cancel pending input if command or menu button pressed
-    if pending and (text.startswith("/") or text in ADMIN_BUTTONS):
-        _admin_pending_actions.pop(chat_id, None)
-        pending = None
+    if waiting and (text.startswith("/") or text in ADMIN_BUTTONS):
+        _waiting_input.pop(chat_id, None)
+        _pending_email.pop(chat_id, None)
 
-    # Handle pending chat_id input
-    if pending and is_admin:
-        target = normalize_chat_id(text)
-        if not target:
-            await bot.send_message(chat_id, "Неверный формат. Введите числовой chat_id:", reply_markup=_kb_cancel())
+    elif waiting == "email_input":
+        email = text.strip()
+        if not is_valid_email(email):
+            await bot.send_message(
+                chat_id,
+                "❌ Некорректный email. Попробуйте ещё раз:",
+                reply_markup=kb_cancel_input(),
+            )
             return
-        recipients = load_recipients()
-        if pending == "add":
-            recipients.add(target)
+        await bot.send_message(chat_id, f"⏳ Отправляю код на {email}…")
+        ok = await send_confirmation_code(chat_id, email)
+        if not ok:
+            await bot.send_message(
+                chat_id,
+                "❌ Не удалось отправить письмо. Проверьте адрес или попробуйте позже.",
+                reply_markup=kb_cancel_input(),
+            )
+            return
+        _waiting_input[chat_id] = "email_code"
+        await bot.send_message(
+            chat_id,
+            f"📬 Код отправлен на {email}.\n\nВведите 6-значный код из письма:",
+            reply_markup=kb_resend_code(email),
+        )
+        return
+
+    elif waiting == "email_code":
+        pending = _pending_email.get(chat_id)
+        if not pending:
+            _waiting_input.pop(chat_id, None)
+            await bot.send_message(chat_id, "Сессия истекла. Начните заново.")
+            return
+        if datetime.now(timezone.utc).timestamp() > pending["expires"]:
+            _waiting_input.pop(chat_id, None)
+            _pending_email.pop(chat_id, None)
+            await bot.send_message(chat_id, "⏰ Код устарел. Начните заново.")
+            return
+        if text.strip() != pending["code"]:
+            await bot.send_message(
+                chat_id,
+                "❌ Неверный код. Попробуйте ещё раз:",
+                reply_markup=kb_resend_code(pending["email"]),
+            )
+            return
+        # Code correct — save email
+        email = pending["email"]
+        _waiting_input.pop(chat_id, None)
+        _pending_email.pop(chat_id, None)
+        r = find_recipient(chat_id)
+        if r:
+            r["email"] = email
+            if "email" not in r.get("channels", []):
+                r.setdefault("channels", []).append("email")
+            recipients = load_recipients()
             save_recipients(recipients)
-            _admin_pending_actions.pop(chat_id, None)
-            await bot.send_message(chat_id, f"✅ Добавлен в рассылку.\nID: {target}", reply_markup=_kb_admin_main())
+        else:
+            upsert_recipient(chat_id, email=email, channels=["telegram", "email"],
+                             name=str(user.get("first_name") or "").strip(),
+                             username=str(user.get("username") or "").strip())
+        await bot.send_message(chat_id, f"✅ Email {email} подтверждён и подключён.")
+        # Notify admins
+        name = display_name(find_recipient(chat_id) or {})
+        for admin_id in sorted(TG_SUPER_ADMIN_IDS):
             try:
-                await bot.send_message(target, "✅ Вы подключены к уведомлениям.")
-            except Exception:
-                pass
-        elif pending == "remove":
-            recipients.discard(target)
-            save_recipients(recipients)
-            _admin_pending_actions.pop(chat_id, None)
-            await bot.send_message(chat_id, f"Удалён из рассылки.\nID: {target}", reply_markup=_kb_admin_main())
-            try:
-                await bot.send_message(target, "ℹ️ Вы отключены от уведомлений.")
+                await bot.send_message(admin_id, f"✅ {name} подтвердил email: {email}")
             except Exception:
                 pass
         return
 
-    # /start
+    elif waiting == "add_chat_id" and is_admin:
+        target = normalize_chat_id(text)
+        if not target:
+            await bot.send_message(chat_id, "Неверный формат. Введите числовой chat_id:", reply_markup=kb_cancel_input())
+            return
+        _waiting_input.pop(chat_id, None)
+        upsert_recipient(target)
+        await bot.send_message(chat_id, f"✅ Добавлен получатель с ID: {target}", reply_markup=kb_admin_main())
+        try:
+            await bot.send_message(target, f"✅ Вы добавлены в рассылку {SITE_NAME}.")
+        except Exception:
+            pass
+        return
+
+    elif waiting == "remove_chat_id" and is_admin:
+        target = normalize_chat_id(text)
+        if not target:
+            await bot.send_message(chat_id, "Неверный формат:", reply_markup=kb_cancel_input())
+            return
+        _waiting_input.pop(chat_id, None)
+        remove_recipient(target)
+        await bot.send_message(chat_id, f"Удалён получатель с ID: {target}", reply_markup=kb_admin_main())
+        try:
+            await bot.send_message(target, f"ℹ️ Вы удалены из рассылки {SITE_NAME}.")
+        except Exception:
+            pass
+        return
+
+    # ── commands ──
     if text == "/start":
         if is_admin:
-            await bot.send_message(
-                chat_id,
-                f"👋 Панель управления {SITE_NAME}",
-                reply_markup=_kb_admin_main(),
-            )
+            await bot.send_message(chat_id, f"👋 Панель управления {SITE_NAME}", reply_markup=kb_admin_main())
         else:
-            in_list = chat_id in load_recipients()
-            if in_list:
-                await bot.send_message(chat_id, "✅ Вы уже подключены к уведомлениям.")
+            r = find_recipient(chat_id)
+            if r:
+                ch = r.get("channels", [])
+                status_parts = []
+                if "telegram" in ch:
+                    status_parts.append("Telegram ✅")
+                if "email" in ch:
+                    status_parts.append(f"Email ✅ ({r.get('email', '')})")
+                await bot.send_message(chat_id, f"Вы подключены к уведомлениям.\n\n" + "\n".join(status_parts))
             else:
                 await bot.send_message(
                     chat_id,
-                    f"👋 Привет!\n\nЭтот бот отправляет уведомления от {SITE_NAME}.\n\nЧтобы получать уведомления — нажмите кнопку ниже. Администратор подтвердит запрос.",
-                    reply_markup=_kb_user_start(),
+                    f"👋 Привет!\n\nЭтот бот отправляет уведомления от {SITE_NAME}.\n\nНажмите кнопку, чтобы запросить доступ:",
+                    reply_markup=kb_user_start(),
                 )
         return
 
-    if text == "/id" or text == "/chat_id":
+    if text in ("/id", "/chat_id"):
         await bot.send_message(chat_id, f"Ваш ID: `{chat_id}`", parse_mode="Markdown")
         return
 
     if not is_admin:
         return
 
-    # Admin menu buttons
+    # ── admin menu ──
     if text == "🆔 Мой ID":
         await bot.send_message(chat_id, f"Ваш ID: `{chat_id}`", parse_mode="Markdown")
         return
 
-    if text == "👥 Список рассылки":
-        await bot.send_message(chat_id, await _format_recipients_list(load_recipients()))
+    if text == "👥 Получатели":
+        await bot.send_message(chat_id, await format_recipients_list())
         return
 
     if text == "➕ Добавить":
-        _admin_pending_actions[chat_id] = "add"
-        await bot.send_message(chat_id, "Введите chat_id пользователя:", reply_markup=_kb_cancel())
+        _waiting_input[chat_id] = "add_chat_id"
+        await bot.send_message(chat_id, "Введите chat_id пользователя:", reply_markup=kb_cancel_input())
         return
 
     if text == "➖ Удалить":
-        _admin_pending_actions[chat_id] = "remove"
-        await bot.send_message(chat_id, "Введите chat_id для удаления:", reply_markup=_kb_cancel())
+        _waiting_input[chat_id] = "remove_chat_id"
+        await bot.send_message(chat_id, "Введите chat_id для удаления:", reply_markup=kb_cancel_input())
         return
 
 
@@ -343,45 +497,42 @@ async def handle_tg_callback(callback: dict):
     data        = str(callback.get("data") or "")
     callback_id = str(callback.get("id") or "")
     message     = callback.get("message") or {}
-    chat_id     = str((message.get("chat") or {}).get("id") or "")
+    chat        = message.get("chat") or {}
+    chat_id     = str(chat.get("id") or "")
     message_id  = message.get("message_id")
+    from_user   = callback.get("from_user") or callback.get("from") or {}
+    is_admin    = chat_id in TG_SUPER_ADMIN_IDS
 
-    # User requests to join
+    async def edit_text(new_text: str):
+        try:
+            await bot.edit_message_text(new_text, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    # ── user actions ──
     if data == "user:request":
-        in_list = chat_id in load_recipients()
-        if in_list:
+        if find_recipient(chat_id):
             await bot.answer_callback_query(callback_id, text="Вы уже в списке рассылки.")
             return
-        label = user_label(message)
-        request_text = (
-            f"🔔 Запрос на подключение уведомлений\n\n"
-            f"👤 {label}\n\n"
-            f"Подключить этого пользователя к рассылке?"
-        )
+        name = str(from_user.get("first_name") or "").strip()
+        username = str(from_user.get("username") or "").strip()
+        label = " · ".join(filter(None, [name or "Без имени", f"@{username}" if username else "", f"ID: {chat_id}"]))
         for admin_id in sorted(TG_SUPER_ADMIN_IDS):
             try:
-                await bot.send_message(admin_id, request_text, reply_markup=_kb_admin_request(chat_id))
+                await bot.send_message(
+                    admin_id,
+                    f"🔔 Запрос на уведомления\n\n👤 {label}\n\nПодключить?",
+                    reply_markup=kb_admin_join_request(chat_id),
+                )
             except Exception as exc:
                 print(f"tg admin notify error {admin_id}: {exc}", flush=True)
         await bot.answer_callback_query(callback_id)
-        await bot.edit_message_text(
-            "⏳ Запрос отправлен. Ожидайте подтверждения от администратора.",
-            chat_id=chat_id,
-            message_id=message_id,
-        )
+        await edit_text("⏳ Запрос отправлен. Ожидайте подтверждения администратора.")
         return
 
-    # Admin actions
-    if not data.startswith("admin:"):
-        return
-
-    parts = data.split(":", 2)
-    if len(parts) != 3:
-        return
-    _, action, target = parts
-
-    if action == "cancel_input":
-        _admin_pending_actions.pop(chat_id, None)
+    if data == "user:cancel_input":
+        _waiting_input.pop(chat_id, None)
+        _pending_email.pop(chat_id, None)
         await bot.answer_callback_query(callback_id, text="Отменено.")
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
@@ -389,35 +540,80 @@ async def handle_tg_callback(callback: dict):
             pass
         return
 
-    if chat_id not in TG_SUPER_ADMIN_IDS:
+    if data == "user:resend_code":
+        pending = _pending_email.get(chat_id)
+        if not pending:
+            await bot.answer_callback_query(callback_id, text="Сессия истекла. Начните заново.", show_alert=True)
+            return
+        ok = await send_confirmation_code(chat_id, pending["email"])
+        if ok:
+            await bot.answer_callback_query(callback_id, text="Код отправлен повторно.")
+        else:
+            await bot.answer_callback_query(callback_id, text="Не удалось отправить письмо.", show_alert=True)
+        return
+
+    # ── admin actions ──
+    if not data.startswith("admin:"):
+        return
+
+    if not is_admin:
         await bot.answer_callback_query(callback_id, text="Нет доступа.", show_alert=True)
         return
 
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, action, target = parts
+
     if action == "approve":
-        recipients = load_recipients()
-        recipients.add(target)
-        save_recipients(recipients)
-        await bot.answer_callback_query(callback_id, text="Подключён.")
-        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
-        await bot.edit_message_text(
-            (message.get("text") or "") + "\n\n✅ Подключён",
-            chat_id=chat_id, message_id=message_id,
-        )
+        from_info = callback.get("from_user") or callback.get("from") or {}
+        # Try to get user info from original message text
+        upsert_recipient(target, channels=["telegram"])
+        await bot.answer_callback_query(callback_id, text="Telegram подключён.")
+        orig_text = message.get("text") or ""
+        await edit_text(orig_text + "\n\n✅ Telegram подключён")
         try:
-            await bot.send_message(target, f"✅ Вы подключены к уведомлениям {SITE_NAME}.")
+            await bot.send_message(
+                target,
+                f"✅ Вы подключены к уведомлениям {SITE_NAME} через Telegram.",
+                reply_markup=kb_admin_join_request.__class__,  # clear kb
+            )
         except Exception:
             pass
-
-    elif action == "decline":
-        await bot.answer_callback_query(callback_id, text="Отклонено.")
-        await bot.edit_message_text(
-            (message.get("text") or "") + "\n\n❌ Отклонено",
-            chat_id=chat_id, message_id=message_id,
+        # Offer admin to request email
+        await bot.send_message(
+            chat_id,
+            f"Хотите также подключить email для этого получателя?",
+            reply_markup=kb_admin_after_approve(target),
         )
+        return
+
+    if action == "decline":
+        await bot.answer_callback_query(callback_id, text="Отклонено.")
+        orig_text = message.get("text") or ""
+        await edit_text(orig_text + "\n\n❌ Отклонено")
         try:
             await bot.send_message(target, "Администратор отклонил ваш запрос.")
         except Exception:
             pass
+        return
+
+    if action == "request_email":
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+        except Exception:
+            pass
+        await bot.answer_callback_query(callback_id)
+        try:
+            await bot.send_message(
+                target,
+                f"📧 Администратор предлагает также подключить уведомления на email.\n\nВведите ваш email:",
+                reply_markup=kb_cancel_input(),
+            )
+            _waiting_input[target] = "email_input"
+        except Exception as exc:
+            await bot.send_message(chat_id, f"Не удалось отправить запрос пользователю: {exc}")
+        return
 
 
 # ───────────── Telegram polling ─────────────
@@ -450,17 +646,12 @@ def _check_token(request: web.Request) -> bool:
 
 def _format_lead(lead: dict) -> str:
     lines = [f"📋 Новая заявка — {SITE_NAME}", ""]
-    if lead.get("name"):
-        lines.append(f"👤 {lead['name']}")
-    if lead.get("contact"):
-        lines.append(f"📞 {lead['contact']}")
-    if lead.get("email"):
-        lines.append(f"✉️  {lead['email']}")
-    if lead.get("message"):
-        lines += ["", f"💬 {lead['message']}"]
+    if lead.get("name"):    lines.append(f"👤 {lead['name']}")
+    if lead.get("contact"): lines.append(f"📞 {lead['contact']}")
+    if lead.get("email"):   lines.append(f"✉️  {lead['email']}")
+    if lead.get("message"): lines += ["", f"💬 {lead['message']}"]
     lines += ["", f"🕐 {lead.get('received_at_human', msk_now())}"]
-    if lead.get("page"):
-        lines.append(f"🔗 {lead['page']}")
+    if lead.get("page"):    lines.append(f"🔗 {lead['page']}")
     return "\n".join(lines)
 
 async def lead_handler(request: web.Request):
@@ -482,7 +673,6 @@ async def lead_handler(request: web.Request):
         "received_at_human": msk_now(),
         "ip":                request.headers.get("X-Real-IP", request.remote or ""),
     }
-
     if not any([lead["name"], lead["contact"], lead["email"]]):
         return web.json_response({"ok": False, "error": "name_or_contact_required"}, status=400)
     if not lead["consent"]:
@@ -497,8 +687,8 @@ async def lead_handler(request: web.Request):
         return web.json_response({"ok": False, "error": "save_failed"}, status=500)
 
     text = _format_lead(lead)
-    asyncio.create_task(tg_broadcast(text, sorted(load_recipients())))
-    asyncio.create_task(send_email_async(f"Новая заявка — {SITE_NAME}", text))
+    asyncio.create_task(tg_broadcast(text, tg_chat_ids_for_leads()))
+    asyncio.create_task(send_email_async(email_addresses_for_leads(), f"Новая заявка — {SITE_NAME}", text))
 
     return web.json_response({"ok": True})
 
@@ -515,30 +705,29 @@ async def notify_handler(request: web.Request):
         return web.json_response({"ok": False, "error": "empty_text"}, status=400)
 
     requested_id = safe(payload.get("chat_id"), 64)
-    chat_ids = [requested_id] if requested_id else sorted(load_recipients())
-    chat_ids = [c for c in dict.fromkeys(chat_ids) if c]
+    chat_ids = [requested_id] if requested_id else tg_chat_ids_for_leads()
 
     tg_sent, errors = 0, []
     if bot:
-        for chat_id in chat_ids:
+        for cid in chat_ids:
             try:
-                await bot.send_message(chat_id, text, disable_web_page_preview=True)
+                await bot.send_message(cid, text, disable_web_page_preview=True)
                 tg_sent += 1
             except Exception as exc:
                 errors.append(str(exc))
 
-    email_errors = await send_email_async(f"Уведомление — {SITE_NAME}", text)
+    email_errors = await send_email_async(email_addresses_for_leads(), f"Уведомление — {SITE_NAME}", text)
     errors.extend(email_errors)
 
     return web.json_response({"ok": True, "tg_sent": tg_sent, "errors": errors})
 
 async def health_handler(_: web.Request):
     return web.json_response({
-        "ok":        True,
-        "service":   "waves-notify",
-        "telegram":  bool(bot),
-        "email":     bool(SMTP_HOST and SMTP_USER),
-        "polling":   bool(_polling_task and not _polling_task.done()),
+        "ok":         True,
+        "service":    "waves-notify",
+        "telegram":   bool(bot),
+        "email":      bool(SMTP_HOST and SMTP_USER),
+        "polling":    bool(_polling_task and not _polling_task.done()),
         "recipients": len(load_recipients()),
     })
 
@@ -549,11 +738,11 @@ async def on_startup(_: web.Application):
     global _polling_task
     if not bot:
         return
-    for chat_id in sorted(TG_SUPER_ADMIN_IDS):
+    for admin_id in sorted(TG_SUPER_ADMIN_IDS):
         try:
-            await bot.send_message(chat_id, f"✅ {SITE_NAME} запущен.")
+            await bot.send_message(admin_id, f"✅ {SITE_NAME} запущен.")
         except Exception as exc:
-            print(f"startup notify error {chat_id}: {exc}", flush=True)
+            print(f"startup notify error {admin_id}: {exc}", flush=True)
     if TG_POLLING_ENABLED:
         await bot.delete_webhook(drop_pending_updates=False)
         _polling_task = asyncio.create_task(polling_loop())
