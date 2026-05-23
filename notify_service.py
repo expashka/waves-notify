@@ -423,8 +423,17 @@ async def handle_tg_message(message: dict):
             await bot.send_message(chat_id, "Неверный формат. Введите числовой chat_id:", reply_markup=kb_cancel_input())
             return
         _waiting_input.pop(chat_id, None)
-        upsert_recipient(target)
-        await bot.send_message(chat_id, f"✅ Добавлен получатель с ID: {target}", reply_markup=kb_admin_main())
+        # Try to fetch name/username from Telegram
+        name, username = "", ""
+        try:
+            tg_chat = await bot.get_chat(target)
+            name = str(getattr(tg_chat, "first_name", "") or getattr(tg_chat, "title", "") or "").strip()
+            username = str(getattr(tg_chat, "username", "") or "").strip()
+        except Exception:
+            pass
+        upsert_recipient(target, name=name, username=username)
+        label = " · ".join(filter(None, [name or f"ID: {target}", f"@{username}" if username else ""]))
+        await bot.send_message(chat_id, f"✅ Добавлен: {label}", reply_markup=kb_admin_main())
         try:
             await bot.send_message(target, f"✅ Вы добавлены в рассылку {SITE_NAME}.")
         except Exception:
@@ -569,9 +578,14 @@ async def handle_tg_callback(callback: dict):
     _, action, target = parts
 
     if action == "approve":
-        from_info = callback.get("from_user") or callback.get("from") or {}
-        # Try to get user info from original message text
-        upsert_recipient(target, channels=["telegram"])
+        name, username = "", ""
+        try:
+            tg_chat = await bot.get_chat(target)
+            name = str(getattr(tg_chat, "first_name", "") or getattr(tg_chat, "title", "") or "").strip()
+            username = str(getattr(tg_chat, "username", "") or "").strip()
+        except Exception:
+            pass
+        upsert_recipient(target, channels=["telegram"], name=name, username=username)
         await bot.answer_callback_query(callback_id, text="Telegram подключён.")
         orig_text = message.get("text") or ""
         await edit_text(orig_text + "\n\n✅ Telegram подключён")
