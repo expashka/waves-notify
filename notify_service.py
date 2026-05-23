@@ -210,8 +210,11 @@ def email_addresses_for_leads() -> list[str]:
 # chat_id → { "email": str, "code": str, "expires": float }
 _pending_email: dict[str, dict] = {}
 
-# chat_id → what we're waiting for: "email_input"
+# chat_id → what we're waiting for
 _waiting_input: dict[str, str] = {}
+
+# admin chat_id → target chat_id they're setting email for
+_admin_email_target: dict[str, str] = {}
 
 
 # ───────────── email sending ─────────────
@@ -282,7 +285,7 @@ def kb_admin_main() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Получатели")],
             [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="➖ Удалить")],
-            [KeyboardButton(text="🆔 Мой ID")],
+            [KeyboardButton(text="📧 Добавить email"), KeyboardButton(text="🆔 Мой ID")],
         ],
         resize_keyboard=True,
     )
@@ -298,7 +301,7 @@ def kb_resend_code(email: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input"),
     ]])
 
-ADMIN_BUTTONS = {"👥 Получатели", "➕ Добавить", "➖ Удалить", "🆔 Мой ID"}
+ADMIN_BUTTONS = {"👥 Получатели", "➕ Добавить", "➖ Удалить", "📧 Добавить email", "🆔 Мой ID"}
 
 
 # ───────────── Telegram broadcast ─────────────
@@ -454,6 +457,45 @@ async def handle_tg_message(message: dict):
             pass
         return
 
+    elif waiting == "admin_email_chat_id" and is_admin:
+        target = normalize_chat_id(text)
+        if not target:
+            await bot.send_message(chat_id, "Неверный chat_id. Попробуйте ещё раз:", reply_markup=kb_cancel_input())
+            return
+        _waiting_input[chat_id] = "admin_email_value"
+        _admin_email_target[chat_id] = target
+        # Show name if recipient exists
+        r = find_recipient(target)
+        hint = f" ({display_name(r)})" if r else f" (ID: {target})"
+        await bot.send_message(chat_id, f"Введите email для получателя{hint}:", reply_markup=kb_cancel_input())
+        return
+
+    elif waiting == "admin_email_value" and is_admin:
+        email = text.strip()
+        if not is_valid_email(email):
+            await bot.send_message(chat_id, "❌ Некорректный email. Попробуйте ещё раз:", reply_markup=kb_cancel_input())
+            return
+        target = _admin_email_target.pop(chat_id, None)
+        _waiting_input.pop(chat_id, None)
+        if not target:
+            await bot.send_message(chat_id, "Сессия истекла.", reply_markup=kb_admin_main())
+            return
+        r = find_recipient(target)
+        if r:
+            r["email"] = email
+            if "email" not in r.get("channels", []):
+                r.setdefault("channels", []).append("email")
+            save_recipients(load_recipients())
+        else:
+            upsert_recipient(target, email=email, channels=["telegram", "email"])
+        label = display_name(find_recipient(target) or {"telegram_id": target})
+        await bot.send_message(chat_id, f"✅ Email {email} добавлен для {label}", reply_markup=kb_admin_main())
+        try:
+            await bot.send_message(target, f"📧 Администратор подключил email-уведомления: {email}")
+        except Exception:
+            pass
+        return
+
     # ── commands ──
     if text == "/start":
         if is_admin:
@@ -502,6 +544,11 @@ async def handle_tg_message(message: dict):
         await bot.send_message(chat_id, "Введите chat_id для удаления:", reply_markup=kb_cancel_input())
         return
 
+    if text == "📧 Добавить email":
+        _waiting_input[chat_id] = "admin_email_chat_id"
+        await bot.send_message(chat_id, "Введите chat_id получателя, которому хотите добавить email:", reply_markup=kb_cancel_input())
+        return
+
 
 # ───────────── Telegram callback handler ─────────────
 
@@ -545,6 +592,7 @@ async def handle_tg_callback(callback: dict):
     if data == "user:cancel_input":
         _waiting_input.pop(chat_id, None)
         _pending_email.pop(chat_id, None)
+        _admin_email_target.pop(chat_id, None)
         await bot.answer_callback_query(callback_id, text="Отменено.")
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
