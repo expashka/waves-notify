@@ -76,22 +76,47 @@ RECIPIENTS_FILE    = Path(os.getenv("RECIPIENTS_FILE") or "/data/recipients.json
 if TG_ADMIN_CHAT_ID:
     TG_SUPER_ADMIN_IDS.add(TG_ADMIN_CHAT_ID)
 
-_SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
+SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
     "yandex": ("smtp.yandex.ru", 465, True),
     "mailru":  ("smtp.mail.ru",   465, True),
     "gmail":   ("smtp.gmail.com", 465, True),
 }
-SMTP_USER     = os.getenv("SMTP_USER", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER).strip()
-SMTP_TO_EXTRA = _parse_ids(os.getenv("SMTP_TO", ""))  # fixed extra recipients
-_provider     = os.getenv("SMTP_PROVIDER", "").strip().lower()
-_preset       = _SMTP_PRESETS.get(_provider, ("", 465, True))
-SMTP_HOST     = os.getenv("SMTP_HOST", _preset[0]).strip()
-SMTP_PORT     = int(os.getenv("SMTP_PORT", str(_preset[1])))
-SMTP_SSL      = os.getenv("SMTP_SSL", "1" if _preset[2] else "0").strip() != "0"
+SMTP_TO_EXTRA  = _parse_ids(os.getenv("SMTP_TO", ""))
+EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))
+SMTP_FILE      = Path(os.getenv("SMTP_FILE") or "/data/smtp.json")
 
-EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))  # seconds
+def _build_smtp_cfg() -> dict:
+    """Load SMTP config: smtp.json overrides env."""
+    cfg: dict = {}
+    # Start from env
+    provider = os.getenv("SMTP_PROVIDER", "").strip().lower()
+    preset   = SMTP_PRESETS.get(provider, ("", 465, True))
+    cfg["host"]     = os.getenv("SMTP_HOST", preset[0]).strip()
+    cfg["port"]     = int(os.getenv("SMTP_PORT", str(preset[1])))
+    cfg["ssl"]      = os.getenv("SMTP_SSL", "1" if preset[2] else "0").strip() != "0"
+    cfg["user"]     = os.getenv("SMTP_USER", "").strip()
+    cfg["password"] = os.getenv("SMTP_PASSWORD", "").strip()
+    cfg["from"]     = os.getenv("SMTP_FROM", cfg["user"]).strip()
+    # Override with saved file
+    try:
+        if SMTP_FILE.exists():
+            saved = json.loads(SMTP_FILE.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                cfg.update(saved)
+    except Exception:
+        pass
+    return cfg
+
+# Mutable runtime SMTP config — update in place to hot-reload without restart
+smtp: dict = _build_smtp_cfg()
+
+def reload_smtp():
+    smtp.update(_build_smtp_cfg())
+
+def save_smtp(cfg: dict):
+    SMTP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SMTP_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    smtp.update(cfg)
 
 
 # ───────────── Telegram setup ─────────────
@@ -216,31 +241,51 @@ _waiting_input: dict[str, str] = {}
 # admin chat_id → target chat_id they're setting email for
 _admin_email_target: dict[str, str] = {}
 
+# admin chat_id → smtp setup state dict
+_smtp_setup: dict[str, dict] = {}
+
 
 # ───────────── email sending ─────────────
 
 def send_email(to: list[str], subject: str, body: str) -> list[str]:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or not to:
+    if not (smtp.get("host") and smtp.get("user") and smtp.get("password")) or not to:
         return []
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
+    msg["From"] = smtp.get("from") or smtp["user"]
     msg["To"] = ", ".join(to)
     try:
-        if SMTP_SSL:
+        if smtp.get("ssl", True):
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, to, msg.as_string())
+            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx) as server:
+                server.login(smtp["user"], smtp["password"])
+                server.sendmail(smtp["user"], to, msg.as_string())
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            with smtplib.SMTP(smtp["host"], smtp["port"]) as server:
                 server.starttls()
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, to, msg.as_string())
+                server.login(smtp["user"], smtp["password"])
+                server.sendmail(smtp["user"], to, msg.as_string())
     except Exception as exc:
         print(f"email error: {exc}", flush=True)
         return [str(exc)]
     return []
+
+def test_smtp_connection() -> str | None:
+    """Returns error string or None if OK."""
+    if not (smtp.get("host") and smtp.get("user") and smtp.get("password")):
+        return "Не настроен SMTP"
+    try:
+        if smtp.get("ssl", True):
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx) as server:
+                server.login(smtp["user"], smtp["password"])
+        else:
+            with smtplib.SMTP(smtp["host"], smtp["port"]) as server:
+                server.starttls()
+                server.login(smtp["user"], smtp["password"])
+        return None
+    except Exception as exc:
+        return str(exc)
 
 async def send_email_async(to: list[str], subject: str, body: str) -> list[str]:
     return await asyncio.get_event_loop().run_in_executor(None, send_email, to, subject, body)
@@ -285,10 +330,29 @@ def kb_admin_main() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Получатели")],
             [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="➖ Удалить")],
-            [KeyboardButton(text="📧 Добавить email"), KeyboardButton(text="🆔 Мой ID")],
+            [KeyboardButton(text="📧 Добавить email"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🆔 Мой ID")],
         ],
         resize_keyboard=True,
     )
+
+def kb_smtp_providers() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Яндекс",  callback_data="smtp:provider:yandex"),
+            InlineKeyboardButton(text="Mail.ru", callback_data="smtp:provider:mailru"),
+            InlineKeyboardButton(text="Gmail",   callback_data="smtp:provider:gmail"),
+        ],
+        [InlineKeyboardButton(text="Свой сервер", callback_data="smtp:provider:custom")],
+        [InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input")],
+    ])
+
+def kb_smtp_status() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить настройки", callback_data="smtp:setup")],
+        [InlineKeyboardButton(text="🔍 Проверить соединение", callback_data="smtp:test")],
+        [InlineKeyboardButton(text="🗑 Сбросить", callback_data="smtp:reset")],
+    ])
 
 def kb_cancel_input() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -301,7 +365,7 @@ def kb_resend_code(email: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Отмена", callback_data="user:cancel_input"),
     ]])
 
-ADMIN_BUTTONS = {"👥 Получатели", "➕ Добавить", "➖ Удалить", "📧 Добавить email", "🆔 Мой ID"}
+ADMIN_BUTTONS = {"👥 Получатели", "➕ Добавить", "➖ Удалить", "📧 Добавить email", "⚙️ Настройки", "🆔 Мой ID"}
 
 
 # ───────────── Telegram broadcast ─────────────
@@ -496,6 +560,61 @@ async def handle_tg_message(message: dict):
             pass
         return
 
+    elif waiting == "smtp_host" and is_admin:
+        _smtp_setup[chat_id]["host"] = text.strip()
+        _waiting_input[chat_id] = "smtp_port"
+        await bot.send_message(chat_id, f"Порт (например 465 для SSL, 587 для STARTTLS):", reply_markup=kb_cancel_input())
+        return
+
+    elif waiting == "smtp_port" and is_admin:
+        if not text.strip().isdigit():
+            await bot.send_message(chat_id, "Введите число:", reply_markup=kb_cancel_input())
+            return
+        _smtp_setup[chat_id]["port"] = int(text.strip())
+        _smtp_setup[chat_id]["ssl"] = int(text.strip()) == 465
+        _waiting_input[chat_id] = "smtp_user"
+        await bot.send_message(chat_id, "Логин (email отправителя):", reply_markup=kb_cancel_input())
+        return
+
+    elif waiting == "smtp_user" and is_admin:
+        _smtp_setup[chat_id]["user"] = text.strip()
+        _smtp_setup[chat_id]["from"] = text.strip()
+        _waiting_input[chat_id] = "smtp_password"
+        await bot.send_message(chat_id, "Пароль (или app password):", reply_markup=kb_cancel_input())
+        return
+
+    elif waiting == "smtp_user_preset" and is_admin:
+        _smtp_setup[chat_id]["user"] = text.strip()
+        _smtp_setup[chat_id]["from"] = text.strip()
+        _waiting_input[chat_id] = "smtp_password"
+        await bot.send_message(chat_id, "Пароль приложения:", reply_markup=kb_cancel_input())
+        return
+
+    elif waiting == "smtp_password" and is_admin:
+        setup = _smtp_setup.pop(chat_id, {})
+        _waiting_input.pop(chat_id, None)
+        setup["password"] = text.strip()
+        # Test connection
+        prev = dict(smtp)
+        smtp.update(setup)
+        await bot.send_message(chat_id, "⏳ Проверяю соединение…")
+        error = await asyncio.get_event_loop().run_in_executor(None, test_smtp_connection)
+        if error:
+            smtp.update(prev)  # rollback
+            await bot.send_message(
+                chat_id,
+                f"❌ Не удалось подключиться:\n{error}\n\nПопробуйте ещё раз через ⚙️ Настройки.",
+                reply_markup=kb_admin_main(),
+            )
+        else:
+            save_smtp(setup)
+            await bot.send_message(
+                chat_id,
+                f"✅ Email настроен!\n\nОтправитель: {setup.get('user')}\nСервер: {setup.get('host')}:{setup.get('port')}",
+                reply_markup=kb_admin_main(),
+            )
+        return
+
     # ── commands ──
     if text == "/start":
         if is_admin:
@@ -549,6 +668,19 @@ async def handle_tg_message(message: dict):
         await bot.send_message(chat_id, "Введите chat_id получателя, которому хотите добавить email:", reply_markup=kb_cancel_input())
         return
 
+    if text == "⚙️ Настройки":
+        if smtp.get("host") and smtp.get("user"):
+            status = (
+                f"📨 Email настроен\n\n"
+                f"Провайдер: {smtp.get('host')}\n"
+                f"Отправитель: {smtp.get('user')}\n"
+                f"SSL: {'да' if smtp.get('ssl') else 'нет'}"
+            )
+            await bot.send_message(chat_id, status, reply_markup=kb_smtp_status())
+        else:
+            await bot.send_message(chat_id, "📨 Email не настроен.\n\nВыберите провайдера:", reply_markup=kb_smtp_providers())
+        return
+
 
 # ───────────── Telegram callback handler ─────────────
 
@@ -589,10 +721,68 @@ async def handle_tg_callback(callback: dict):
         await edit_text("⏳ Запрос отправлен. Ожидайте подтверждения администратора.")
         return
 
+    # ── smtp setup callbacks ──
+    if data == "smtp:setup" or data == "smtp:provider:yandex" or data == "smtp:provider:mailru" \
+            or data == "smtp:provider:gmail" or data == "smtp:provider:custom":
+        if not is_admin:
+            await bot.answer_callback_query(callback_id, text="Нет доступа.", show_alert=True)
+            return
+        await bot.answer_callback_query(callback_id)
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+        except Exception:
+            pass
+        if data in ("smtp:setup",):
+            await bot.send_message(chat_id, "Выберите провайдера:", reply_markup=kb_smtp_providers())
+            return
+        provider_key = data.split(":")[-1]
+        if provider_key == "custom":
+            _smtp_setup[chat_id] = {}
+            _waiting_input[chat_id] = "smtp_host"
+            await bot.send_message(chat_id, "Введите SMTP хост (например smtp.example.com):", reply_markup=kb_cancel_input())
+        else:
+            preset = SMTP_PRESETS[provider_key]
+            _smtp_setup[chat_id] = {"host": preset[0], "port": preset[1], "ssl": preset[2]}
+            _waiting_input[chat_id] = "smtp_user_preset"
+            provider_names = {"yandex": "Яндекс", "mailru": "Mail.ru", "gmail": "Gmail"}
+            await bot.send_message(
+                chat_id,
+                f"Провайдер: {provider_names[provider_key]}\nСервер: {preset[0]}:{preset[1]}\n\nВведите ваш email:",
+                reply_markup=kb_cancel_input(),
+            )
+        return
+
+    if data == "smtp:test":
+        if not is_admin:
+            await bot.answer_callback_query(callback_id, text="Нет доступа.", show_alert=True)
+            return
+        await bot.answer_callback_query(callback_id)
+        await bot.send_message(chat_id, "⏳ Проверяю соединение…")
+        error = await asyncio.get_event_loop().run_in_executor(None, test_smtp_connection)
+        if error:
+            await bot.send_message(chat_id, f"❌ Ошибка: {error}", reply_markup=kb_smtp_status())
+        else:
+            await bot.send_message(chat_id, "✅ Соединение успешно!", reply_markup=kb_smtp_status())
+        return
+
+    if data == "smtp:reset":
+        if not is_admin:
+            await bot.answer_callback_query(callback_id, text="Нет доступа.", show_alert=True)
+            return
+        try:
+            SMTP_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        smtp.update(_build_smtp_cfg())
+        await bot.answer_callback_query(callback_id, text="Настройки сброшены.")
+        await bot.send_message(chat_id, "🗑 SMTP настройки сброшены.", reply_markup=kb_admin_main())
+        return
+
     if data == "user:cancel_input":
         _waiting_input.pop(chat_id, None)
         _pending_email.pop(chat_id, None)
         _admin_email_target.pop(chat_id, None)
+        _smtp_setup.pop(chat_id, None)
         await bot.answer_callback_query(callback_id, text="Отменено.")
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
@@ -818,7 +1008,7 @@ async def health_handler(_: web.Request):
         "ok":         True,
         "service":    "waves-notify",
         "telegram":   bool(bot),
-        "email":      bool(SMTP_HOST and SMTP_USER),
+        "email":      bool(smtp.get("host") and smtp.get("user")),
         "polling":    bool(_polling_task and not _polling_task.done()),
         "recipients": len(load_recipients()),
     })
