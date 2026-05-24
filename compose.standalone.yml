@@ -1,5 +1,5 @@
-# Standalone run — for local testing of waves-notify on its own.
-# For real use, EMBED it into your landing project instead (see README → "Встраивание").
+# Standalone-запуск — для локального теста waves-notify самого по себе.
+# Для реального использования ВСТРАИВАЙ его в проект-лендинг (см. README → «Встраивание»).
 #   docker compose -f compose.standalone.yml up -d --build
 services:
   notify:

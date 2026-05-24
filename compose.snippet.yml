@@ -1,16 +1,16 @@
 # ─────────────────────────────────────────────────────────────
-# waves-notify — service block to PASTE into your landing's compose.yml.
+# waves-notify — блок сервиса для ВСТАВКИ в compose.yml твоего лендинга.
 #
-# 1. Copy this repo into your project as ./notify/
-# 2. Paste the `notify:` service below into your project's services:
-# 3. Make sure your project has a network the web app and notify share,
-#    and that the web app calls http://waves-notify:8080/lead
+# 1. Скопируй этот репозиторий в проект как ./notify/
+# 2. Вставь сервис `notify:` (ниже) в секцию services: своего проекта
+# 3. Убедись, что у проекта есть общая сеть для веб-приложения и notify,
+#    и что веб-приложение обращается к http://waves-notify:8080/lead
 #
-# Notes:
-#   • PORT: 8080 is set explicitly because a shared project .env often
-#     defines PORT (e.g. 3000 for Next.js) which waves-notify would
-#     otherwise inherit and bind to the wrong port.
-#   • Alias `waves-notify` is what the web app uses as the hostname.
+# Важно:
+#   • PORT: 8080 задан явно, потому что общий .env проекта часто содержит
+#     PORT (например 3000 у Next.js) — иначе waves-notify унаследует его
+#     и поднимется не на том порту.
+#   • Алиас `waves-notify` — это хост, по которому к нему обращается веб-приложение.
 # ─────────────────────────────────────────────────────────────
 services:
   notify:
@@ -18,12 +18,12 @@ services:
       context: ./notify
     restart: unless-stopped
     env_file:
-      - .env                # reuse the project's .env (TG_BOT_TOKEN, TG_ADMIN_CHAT_ID, SITE_NAME, …)
+      - .env                # общий .env проекта (TG_BOT_TOKEN, TG_ADMIN_CHAT_ID, SITE_NAME, …)
     environment:
-      PORT: 8080            # override any PORT inherited from the shared .env
+      PORT: 8080            # переопределяет PORT, унаследованный из общего .env
     volumes:
       - ./notify/data:/data
     networks:
-      web:                  # replace with the network your web app is on
+      web:                  # замени на сеть, в которой находится твоё веб-приложение
         aliases:
-          - waves-notify    # web app reaches it at http://waves-notify:8080
+          - waves-notify    # веб-приложение обращается к нему по http://waves-notify:8080
