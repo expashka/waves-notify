@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────
+# waves-notify — service block to PASTE into your landing's compose.yml.
+#
+# 1. Copy this repo into your project as ./notify/
+# 2. Paste the `notify:` service below into your project's services:
+# 3. Make sure your project has a network the web app and notify share,
+#    and that the web app calls http://waves-notify:8080/lead
+#
+# Notes:
+#   • PORT: 8080 is set explicitly because a shared project .env often
+#     defines PORT (e.g. 3000 for Next.js) which waves-notify would
+#     otherwise inherit and bind to the wrong port.
+#   • Alias `waves-notify` is what the web app uses as the hostname.
+# ─────────────────────────────────────────────────────────────
+services:
+  notify:
+    build:
+      context: ./notify
+    restart: unless-stopped
+    env_file:
+      - .env                # reuse the project's .env (TG_BOT_TOKEN, TG_ADMIN_CHAT_ID, SITE_NAME, …)
+    environment:
+      PORT: 8080            # override any PORT inherited from the shared .env
+    volumes:
+      - ./notify/data:/data
+    networks:
+      web:                  # replace with the network your web app is on
+        aliases:
+          - waves-notify    # web app reaches it at http://waves-notify:8080

@@ -1,17 +1,51 @@
 # waves-notify
 
-Универсальный сервис уведомлений для лендингов. Принимает заявки с форм по HTTP и отправляет их в **Telegram** и/или **Email**. Оба канала независимы и опциональны.
+**Встраиваемый шаблон** уведомлений для лендингов — не самодостаточный сервис, а блок, который копируется внутрь твоего проекта. Принимает заявки с форм по HTTP и отправляет их в **Telegram** и/или **Email**. Оба канала независимы и опциональны.
 
 ---
 
-## Быстрый старт
+## Встраивание в лендинг (основной сценарий)
+
+waves-notify живёт рядом с твоим веб-приложением как ещё один сервис в его `compose.yml` и читает общий `.env` проекта.
+
+1. **Скопируй репозиторий в проект** как папку `notify/`:
+   ```bash
+   git clone https://github.com/expashka/waves-notify.git your-project/notify
+   rm -rf your-project/notify/.git
+   ```
+
+2. **Добавь сервис в `compose.yml` проекта** — возьми готовый блок из [`compose.snippet.yml`](compose.snippet.yml). Ключевое:
+   ```yaml
+   notify:
+     build: { context: ./notify }
+     env_file: [ .env ]          # общий .env проекта
+     environment: { PORT: 8080 } # чтобы не унаследовать PORT веб-приложения
+     networks:
+       web:
+         aliases: [ waves-notify ]
+   ```
+
+3. **Добавь в `.env` проекта** ключи Telegram (и/или SMTP):
+   ```
+   SITE_NAME=My Site
+   TG_BOT_TOKEN=123456789:AAG...
+   TG_ADMIN_CHAT_ID=твой_chat_id
+   ```
+
+4. **Вызывай из веб-приложения** `POST http://waves-notify:8080/lead` (см. «Подключение формы»).
+
+> **Почему `PORT: 8080` в `environment`?** Общий `.env` часто содержит `PORT` веб-приложения (например `3000` у Next.js). Без явного переопределения waves-notify унаследует его и поднимется не на том порту.
+
+---
+
+## Локальный тест (standalone)
+
+Проверить сервис сам по себе, без проекта:
 
 ```bash
-git clone https://github.com/expashka/waves-notify.git
-cd waves-notify
 cp .env.example .env
 # заполни TG_BOT_TOKEN и/или SMTP в .env
-docker compose up -d
+docker compose -f compose.standalone.yml up -d --build
 ```
 
 ---
@@ -127,7 +161,7 @@ SMTP можно настроить полностью через бота — т
 
 ## Данные
 
-Все данные хранятся в папке `./data/`:
+Все данные хранятся в смонтированной папке `data/` (при встраивании — `./notify/data/`, в standalone — `./data/`):
 
 - `leads.jsonl` — заявки с форм
 - `recipients.json` — список получателей уведомлений

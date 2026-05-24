@@ -1,0 +1,12 @@
+# Standalone run — for local testing of waves-notify on its own.
+# For real use, EMBED it into your landing project instead (see README → "Встраивание").
+#   docker compose -f compose.standalone.yml up -d --build
+services:
+  notify:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
