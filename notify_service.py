@@ -22,6 +22,8 @@ import secrets
 import smtplib
 import ssl
 import string
+import time
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -72,6 +74,8 @@ TG_BOT_TOKEN       = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_ADMIN_CHAT_ID   = os.getenv("TG_ADMIN_CHAT_ID", "").strip()
 TG_SUPER_ADMIN_IDS = _parse_ids(os.getenv("TG_SUPER_ADMIN_IDS", ""))
 TG_POLLING_ENABLED = os.getenv("TG_POLLING_ENABLED", "1").strip() != "0"
+# 1 = show link previews in broadcast/notify, 0 = disable (default)
+TG_WEB_PREVIEW     = os.getenv("TG_WEB_PREVIEW", "0").strip() != "0"
 RECIPIENTS_FILE    = Path(os.getenv("RECIPIENTS_FILE") or "/data/recipients.json")
 
 if TG_ADMIN_CHAT_ID:
@@ -86,10 +90,27 @@ SMTP_TO_EXTRA  = _parse_ids(os.getenv("SMTP_TO", ""))
 EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))
 SMTP_FILE      = Path(os.getenv("SMTP_FILE") or "/data/smtp.json")
 
+# Rate limiting for /lead: max N requests per IP per window (seconds).
+# Set LEAD_RATE_LIMIT=0 to disable.
+LEAD_RATE_LIMIT  = int(os.getenv("LEAD_RATE_LIMIT", "5"))
+LEAD_RATE_WINDOW = int(os.getenv("LEAD_RATE_WINDOW", "60"))
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+def _check_rate_limit(ip: str) -> bool:
+    if LEAD_RATE_LIMIT <= 0:
+        return True
+    now = time.monotonic()
+    cutoff = now - LEAD_RATE_WINDOW
+    bucket = _rate_buckets[ip]
+    _rate_buckets[ip] = [t for t in bucket if t > cutoff]
+    if len(_rate_buckets[ip]) >= LEAD_RATE_LIMIT:
+        return False
+    _rate_buckets[ip].append(now)
+    return True
+
 def _build_smtp_cfg() -> dict:
     """Load SMTP config: smtp.json overrides env."""
     cfg: dict = {}
-    # Start from env
     provider = os.getenv("SMTP_PROVIDER", "").strip().lower()
     preset   = SMTP_PRESETS.get(provider, ("", 465, True))
     cfg["host"]     = os.getenv("SMTP_HOST", preset[0]).strip()
@@ -98,7 +119,6 @@ def _build_smtp_cfg() -> dict:
     cfg["user"]     = os.getenv("SMTP_USER", "").strip()
     cfg["password"] = os.getenv("SMTP_PASSWORD", "").strip()
     cfg["from"]     = os.getenv("SMTP_FROM", cfg["user"]).strip()
-    # Override with saved file
     try:
         if SMTP_FILE.exists():
             saved = json.loads(SMTP_FILE.read_text(encoding="utf-8"))
@@ -178,6 +198,15 @@ def load_recipients() -> list[dict]:
         if RECIPIENTS_FILE.exists():
             data = json.loads(RECIPIENTS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
+                # Auto-migrate: old format was a plain list of chat_id strings
+                if data and isinstance(data[0], str):
+                    migrated = [
+                        {"telegram_id": str(item).strip(), "channels": ["telegram"]}
+                        for item in data if str(item).strip()
+                    ]
+                    save_recipients(migrated)
+                    print(f"recipients.json migrated {len(migrated)} entries to new format", flush=True)
+                    return migrated
                 return data
     except Exception:
         pass
@@ -216,7 +245,6 @@ def tg_chat_ids_for_leads() -> list[str]:
     for r in load_recipients():
         if "telegram" in r.get("channels", []) and r.get("telegram_id"):
             ids.append(str(r["telegram_id"]))
-    # also include admins
     for aid in sorted(TG_SUPER_ADMIN_IDS):
         if aid not in ids:
             ids.append(aid)
@@ -289,7 +317,7 @@ def test_smtp_connection() -> str | None:
         return str(exc)
 
 async def send_email_async(to: list[str], subject: str, body: str) -> list[str]:
-    return await asyncio.get_event_loop().run_in_executor(None, send_email, to, subject, body)
+    return await asyncio.get_running_loop().run_in_executor(None, send_email, to, subject, body)
 
 async def send_confirmation_code(chat_id: str, email: str) -> bool:
     code = generate_code()
@@ -399,7 +427,7 @@ async def tg_broadcast(text: str, chat_ids: list[str]):
         return
     for chat_id in chat_ids:
         try:
-            await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            await bot.send_message(chat_id, text, disable_web_page_preview=not TG_WEB_PREVIEW)
         except Exception as exc:
             print(f"tg send error {chat_id}: {exc}", flush=True)
 
@@ -503,7 +531,6 @@ async def handle_tg_message(message: dict):
                              name=str(user.get("first_name") or "").strip(),
                              username=str(user.get("username") or "").strip())
         await bot.send_message(chat_id, f"✅ Email {email} подтверждён и подключён.")
-        # Notify admins
         name = display_name(find_recipient(chat_id) or {})
         for admin_id in sorted(TG_SUPER_ADMIN_IDS):
             try:
@@ -518,7 +545,6 @@ async def handle_tg_message(message: dict):
             await bot.send_message(chat_id, "Неверный формат. Введите числовой chat_id:", reply_markup=kb_cancel_input())
             return
         _waiting_input.pop(chat_id, None)
-        # Try to fetch name/username from Telegram
         name, username = "", ""
         try:
             tg_chat = await bot.get_chat(target)
@@ -614,7 +640,7 @@ async def handle_tg_message(message: dict):
     elif waiting == "smtp_host" and is_admin:
         _smtp_setup[chat_id]["host"] = text.strip()
         _waiting_input[chat_id] = "smtp_port"
-        await bot.send_message(chat_id, f"Порт (например 465 для SSL, 587 для STARTTLS):", reply_markup=kb_cancel_input())
+        await bot.send_message(chat_id, "Порт (например 465 для SSL, 587 для STARTTLS):", reply_markup=kb_cancel_input())
         return
 
     elif waiting == "smtp_port" and is_admin:
@@ -631,25 +657,34 @@ async def handle_tg_message(message: dict):
         _smtp_setup[chat_id]["user"] = text.strip()
         _smtp_setup[chat_id]["from"] = text.strip()
         _waiting_input[chat_id] = "smtp_password"
-        await bot.send_message(chat_id, "Пароль (или app password):", reply_markup=kb_cancel_input())
+        await bot.send_message(
+            chat_id,
+            "Пароль (или app password):\n\n"
+            "⚠️ Используйте пароль приложения, не основной — он будет виден в истории чата.",
+            reply_markup=kb_cancel_input(),
+        )
         return
 
     elif waiting == "smtp_user_preset" and is_admin:
         _smtp_setup[chat_id]["user"] = text.strip()
         _smtp_setup[chat_id]["from"] = text.strip()
         _waiting_input[chat_id] = "smtp_password"
-        await bot.send_message(chat_id, "Пароль приложения:", reply_markup=kb_cancel_input())
+        await bot.send_message(
+            chat_id,
+            "Пароль приложения:\n\n"
+            "⚠️ Используйте пароль приложения, не основной — он будет виден в истории чата.",
+            reply_markup=kb_cancel_input(),
+        )
         return
 
     elif waiting == "smtp_password" and is_admin:
         setup = _smtp_setup.pop(chat_id, {})
         _waiting_input.pop(chat_id, None)
         setup["password"] = text.strip()
-        # Test connection
         prev = dict(smtp)
         smtp.update(setup)
         await bot.send_message(chat_id, "⏳ Проверяю соединение…")
-        error = await asyncio.get_event_loop().run_in_executor(None, test_smtp_connection)
+        error = await asyncio.get_running_loop().run_in_executor(None, test_smtp_connection)
         if error:
             smtp.update(prev)  # rollback
             await bot.send_message(
@@ -819,7 +854,7 @@ async def handle_tg_callback(callback: dict):
             return
         await bot.answer_callback_query(callback_id)
         await bot.send_message(chat_id, "⏳ Проверяю соединение…")
-        error = await asyncio.get_event_loop().run_in_executor(None, test_smtp_connection)
+        error = await asyncio.get_running_loop().run_in_executor(None, test_smtp_connection)
         if error:
             await bot.send_message(chat_id, f"❌ Ошибка: {error}", reply_markup=kb_smtp_status())
         else:
@@ -993,7 +1028,6 @@ async def handle_tg_callback(callback: dict):
             )
         except Exception:
             pass
-        # Offer admin to request email
         await bot.send_message(
             chat_id,
             f"Хотите также подключить email для этого получателя?",
@@ -1032,6 +1066,17 @@ async def handle_tg_callback(callback: dict):
 # ───────────── Telegram polling ─────────────
 
 async def polling_loop():
+    # Ensure webhook is cleared before long-polling starts, retry until success.
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"delete_webhook error, retrying in 5s: {exc}", flush=True)
+            await asyncio.sleep(5)
+
     offset = 0
     while True:
         try:
@@ -1053,8 +1098,9 @@ async def polling_loop():
 # ───────────── HTTP handlers ─────────────
 
 def _check_token(request: web.Request) -> bool:
+    # No secret configured → open access (caller trusts the network boundary)
     if not NOTIFY_SECRET:
-        return False
+        return True
     provided = request.headers.get("X-Notify-Token", "")
     return hmac.compare_digest(provided, NOTIFY_SECRET)
 
@@ -1069,6 +1115,10 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 async def lead_handler(request: web.Request):
+    ip = request.headers.get("X-Real-IP", request.remote or "")
+    if not _check_rate_limit(ip):
+        return web.json_response({"ok": False, "error": "rate_limited"}, status=429)
+
     try:
         payload = await request.json()
     except Exception:
@@ -1085,7 +1135,7 @@ async def lead_handler(request: web.Request):
         "page":              safe(payload.get("page"), 500),
         "received_at":       datetime.now(timezone.utc).isoformat(),
         "received_at_human": msk_now(),
-        "ip":                request.headers.get("X-Real-IP", request.remote or ""),
+        "ip":                ip,
     }
     if not any([lead["name"], lead["contact"], lead["email"]]):
         return web.json_response({"ok": False, "error": "name_or_contact_required"}, status=400)
@@ -1126,7 +1176,7 @@ async def notify_handler(request: web.Request):
     if bot:
         for cid in chat_ids:
             try:
-                await bot.send_message(cid, text, disable_web_page_preview=True)
+                await bot.send_message(cid, text, disable_web_page_preview=not TG_WEB_PREVIEW)
                 tg_sent += 1
             except Exception as exc:
                 errors.append(str(exc))
@@ -1178,14 +1228,15 @@ async def on_startup(_: web.Application):
     global _polling_task
     if not bot:
         return
+    # Start polling first (delete_webhook is handled inside polling_loop with retry),
+    # then notify admins so the message arrives only once the bot is ready to respond.
+    if TG_POLLING_ENABLED:
+        _polling_task = asyncio.create_task(polling_loop())
     for admin_id in sorted(TG_SUPER_ADMIN_IDS):
         try:
             await bot.send_message(admin_id, f"✅ {SITE_NAME} запущен.")
         except Exception as exc:
             print(f"startup notify error {admin_id}: {exc}", flush=True)
-    if TG_POLLING_ENABLED:
-        await bot.delete_webhook(drop_pending_updates=False)
-        _polling_task = asyncio.create_task(polling_loop())
 
 async def on_cleanup(_: web.Application):
     if _polling_task:
