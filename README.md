@@ -8,39 +8,51 @@
 
 waves-notify живёт рядом с твоим веб-приложением как ещё один сервис в его `compose.yml` и читает общий `.env` проекта.
 
-1. **Скопируй репозиторий в проект** как папку `notify/`:
-   ```bash
-   git clone https://github.com/expashka/waves-notify.git your-project/notify
-   rm -rf your-project/notify/.git
-   ```
+### Через git subtree (рекомендуется)
 
-2. **Добавь сервис в `compose.yml` проекта** — возьми готовый блок из [`compose.snippet.yml`](compose.snippet.yml). Ключевое:
-   ```yaml
-   notify:
-     build: { context: ./notify }
-     env_file: [ .env ]          # общий .env проекта
-     environment: { PORT: 8080 } # чтобы не унаследовать PORT веб-приложения
-     networks:
-       web:
-         aliases: [ waves-notify ]
-   ```
+Позволяет подтягивать обновления из upstream одной командой.
 
-3. **Добавь в `.env` проекта** ключи Telegram (и/или SMTP):
-   ```
-   SITE_NAME=My Site
-   TG_BOT_TOKEN=123456789:AAG...
-   TG_ADMIN_CHAT_ID=твой_chat_id
-   ```
+```bash
+# Добавить в проект (один раз)
+git subtree add --prefix notify \
+  git@github.com-waves-notify:expashka/waves-notify.git main --squash
 
-4. **Вызывай из веб-приложения** `POST http://waves-notify:8080/lead` (см. «Подключение формы»).
+# Обновить до последней версии
+git subtree pull --prefix notify \
+  git@github.com-waves-notify:expashka/waves-notify.git main --squash
+```
+
+Замени `notify` на нужную директорию (`api/`, `apps/site/notify/` и т.д.).  
+SSH-алиас `github.com-waves-notify` должен быть настроен в `~/.ssh/config`.
+
+### Ручное копирование
+
+```bash
+git clone https://github.com/expashka/waves-notify.git your-project/notify
+rm -rf your-project/notify/.git
+```
+
+---
+
+## Настройка в compose.yml
+
+Добавь сервис в `compose.yml` проекта — возьми готовый блок из [`compose.snippet.yml`](compose.snippet.yml). Ключевое:
+
+```yaml
+notify:
+  build: { context: ./notify }
+  env_file: [ .env ]          # общий .env проекта
+  environment: { PORT: 8080 } # чтобы не унаследовать PORT веб-приложения
+  networks:
+    web:
+      aliases: [ waves-notify ]
+```
 
 > **Почему `PORT: 8080` в `environment`?** Общий `.env` часто содержит `PORT` веб-приложения (например `3000` у Next.js). Без явного переопределения waves-notify унаследует его и поднимется не на том порту.
 
 ---
 
 ## Локальный тест (standalone)
-
-Проверить сервис сам по себе, без проекта:
 
 ```bash
 cp .env.example .env
@@ -102,7 +114,7 @@ await fetch('https://your-domain.ru/lead', {
 
 1. Сотрудник пишет боту `/start` → нажимает **🔔 Запросить уведомления**
 2. Администратор получает запрос → нажимает **✅ Подключить**
-3. Опционально: admin предлагает email → сотрудник вводит адрес → получает код на почту → вводит код → email подключён
+3. Опционально: admin предлагает email → сотрудник вводит адрес → получает код → вводит код → email подключён
 
 ### Настройка SMTP через бота
 
@@ -116,6 +128,7 @@ await fetch('https://your-domain.ru/lead', {
 |-------|------|----------|
 | `POST` | `/lead` | Принять заявку с формы |
 | `POST` | `/notify` | Отправить произвольный текст (требует `NOTIFY_SECRET`) |
+| `POST` | `/cookie-consent` | Зафиксировать согласие с cookie-политикой |
 | `GET` | `/health` | Статус сервиса |
 
 ### POST /notify
@@ -137,23 +150,26 @@ Content-Type: application/json
 
 ## Переменные окружения
 
-| Переменная | Обязательно | Описание |
-|------------|:-----------:|----------|
-| `TG_BOT_TOKEN` | — | Токен Telegram-бота |
-| `TG_ADMIN_CHAT_ID` | — | `chat_id` администратора |
-| `TG_SUPER_ADMIN_IDS` | — | Дополнительные admin ID через запятую |
-| `TG_POLLING_ENABLED` | — | `1` (по умолчанию) — включить polling |
-| `SITE_NAME` | — | Название сайта в уведомлениях |
-| `PORT` | — | Порт сервиса (по умолчанию `8080`) |
-| `NOTIFY_SECRET` | — | Токен для защиты `/notify` |
-| `LEADS_FILE` | — | Путь к файлу заявок (по умолчанию `/data/leads.jsonl`) |
-| `RECIPIENTS_FILE` | — | Путь к файлу получателей (по умолчанию `/data/recipients.json`) |
-| `SMTP_FILE` | — | Путь к файлу SMTP-настроек (по умолчанию `/data/smtp.json`) |
-| `SMTP_PROVIDER` | — | Пресет: `yandex`, `mailru`, `gmail` |
-| `SMTP_USER` | — | Логин (email отправителя) |
-| `SMTP_PASSWORD` | — | Пароль приложения |
-| `SMTP_FROM` | — | Адрес отправителя (если отличается от логина) |
-| `SMTP_TO` | — | Дополнительные email получателей через запятую |
+| Переменная | Описание |
+|------------|----------|
+| `TG_BOT_TOKEN` | Токен Telegram-бота |
+| `TG_ADMIN_CHAT_ID` | `chat_id` администратора |
+| `TG_SUPER_ADMIN_IDS` | Дополнительные admin ID через запятую |
+| `TG_POLLING_ENABLED` | `1` (по умолчанию) — включить polling |
+| `TG_WEB_PREVIEW` | `1` — показывать превью ссылок в Telegram-сообщениях |
+| `SITE_NAME` | Название сайта в уведомлениях |
+| `PORT` | Порт сервиса (по умолчанию `8080`) |
+| `NOTIFY_SECRET` | Токен для защиты `/notify` |
+| `LEADS_FILE` | Путь к файлу заявок (по умолчанию `/data/leads.jsonl`) |
+| `RECIPIENTS_FILE` | Путь к файлу получателей (по умолчанию `/data/recipients.json`) |
+| `SMTP_FILE` | Путь к файлу SMTP-настроек (по умолчанию `/data/smtp.json`) |
+| `SMTP_PROVIDER` | Пресет: `yandex`, `mailru`, `gmail` |
+| `SMTP_USER` | Логин (email отправителя) |
+| `SMTP_PASSWORD` | Пароль приложения |
+| `SMTP_FROM` | Адрес отправителя (если отличается от логина) |
+| `SMTP_TO` | Дополнительные email получателей через запятую |
+| `LEAD_RATE_LIMIT` | Макс. заявок с одного IP за окно (по умолчанию `5`, `0` — отключить) |
+| `LEAD_RATE_WINDOW` | Окно rate limit в секундах (по умолчанию `60`) |
 
 SMTP можно настроить полностью через бота — тогда файл `.env` трогать не нужно.
 
@@ -167,3 +183,13 @@ SMTP можно настроить полностью через бота — т
 - `recipients.json` — список получателей уведомлений
 - `smtp.json` — настройки SMTP (если настраивались через бота)
 - `cookie_consents.jsonl` — согласия с cookie-политикой
+
+---
+
+## Сайты, использующие waves-notify
+
+| Проект | Путь в репо | Порт | Контейнер |
+|--------|-------------|------|-----------|
+| poker-show | `api/` | 8081 | `poker-show-api` |
+| wavespodcasts | `notify/` | 8080 | `wavespodcasts-notify-1` |
+| ai-photobooth | `apps/site/notify/` | 8082 | `ai-photobooth-site-notify` |
