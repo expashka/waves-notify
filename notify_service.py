@@ -15,9 +15,10 @@ Bot flow:
 """
 
 import asyncio
+import hmac
 import json
 import os
-import random
+import secrets
 import smtplib
 import ssl
 import string
@@ -156,7 +157,7 @@ def is_valid_email(value: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value.strip()))
 
 def generate_code() -> str:
-    return "".join(random.choices(string.digits, k=6))
+    return "".join(secrets.choice(string.digits) for _ in range(6))
 
 def display_name(r: dict) -> str:
     name = r.get("name") or ""
@@ -257,11 +258,11 @@ def send_email(to: list[str], subject: str, body: str) -> list[str]:
     try:
         if smtp.get("ssl", True):
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx) as server:
+            with smtplib.SMTP_SSL(smtp["host"], smtp["port"], context=ctx, timeout=30) as server:
                 server.login(smtp["user"], smtp["password"])
                 server.sendmail(smtp["user"], to, msg.as_string())
         else:
-            with smtplib.SMTP(smtp["host"], smtp["port"]) as server:
+            with smtplib.SMTP(smtp["host"], smtp["port"], timeout=30) as server:
                 server.starttls()
                 server.login(smtp["user"], smtp["password"])
                 server.sendmail(smtp["user"], to, msg.as_string())
@@ -486,12 +487,16 @@ async def handle_tg_message(message: dict):
         email = pending["email"]
         _waiting_input.pop(chat_id, None)
         _pending_email.pop(chat_id, None)
-        r = find_recipient(chat_id)
-        if r:
-            r["email"] = email
-            if "email" not in r.get("channels", []):
-                r.setdefault("channels", []).append("email")
-            recipients = load_recipients()
+        recipients = load_recipients()
+        found = False
+        for rec in recipients:
+            if str(rec.get("telegram_id", "")) == chat_id:
+                rec["email"] = email
+                if "email" not in rec.get("channels", []):
+                    rec.setdefault("channels", []).append("email")
+                found = True
+                break
+        if found:
             save_recipients(recipients)
         else:
             upsert_recipient(chat_id, email=email, channels=["telegram", "email"],
@@ -1049,8 +1054,9 @@ async def polling_loop():
 
 def _check_token(request: web.Request) -> bool:
     if not NOTIFY_SECRET:
-        return True
-    return request.headers.get("X-Notify-Token", "") == NOTIFY_SECRET
+        return False
+    provided = request.headers.get("X-Notify-Token", "")
+    return hmac.compare_digest(provided, NOTIFY_SECRET)
 
 def _format_lead(lead: dict) -> str:
     lines = [f"📋 Новая заявка — {SITE_NAME}", ""]
@@ -1113,7 +1119,8 @@ async def notify_handler(request: web.Request):
         return web.json_response({"ok": False, "error": "empty_text"}, status=400)
 
     requested_id = safe(payload.get("chat_id"), 64)
-    chat_ids = [requested_id] if requested_id else tg_chat_ids_for_leads()
+    broadcast = not requested_id
+    chat_ids = tg_chat_ids_for_leads() if broadcast else [requested_id]
 
     tg_sent, errors = 0, []
     if bot:
@@ -1124,8 +1131,9 @@ async def notify_handler(request: web.Request):
             except Exception as exc:
                 errors.append(str(exc))
 
-    email_errors = await send_email_async(email_addresses_for_leads(), f"Уведомление — {SITE_NAME}", text)
-    errors.extend(email_errors)
+    if broadcast:
+        email_errors = await send_email_async(email_addresses_for_leads(), f"Уведомление — {SITE_NAME}", text)
+        errors.extend(email_errors)
 
     return web.json_response({"ok": True, "tg_sent": tg_sent, "errors": errors})
 
@@ -1158,12 +1166,9 @@ async def cookie_consent_handler(request: web.Request):
 
 async def health_handler(_: web.Request):
     return web.json_response({
-        "ok":         True,
-        "service":    "waves-notify",
-        "telegram":   bool(bot),
-        "email":      bool(smtp.get("host") and smtp.get("user")),
-        "polling":    bool(_polling_task and not _polling_task.done()),
-        "recipients": len(load_recipients()),
+        "ok":      True,
+        "service": "waves-notify",
+        "polling": bool(_polling_task and not _polling_task.done()),
     })
 
 
