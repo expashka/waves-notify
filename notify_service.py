@@ -88,18 +88,38 @@ SMTP_PRESETS: dict[str, tuple[str, int, bool]] = {
 }
 SMTP_TO_EXTRA  = _parse_ids(os.getenv("SMTP_TO", ""))
 EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))
-SMTP_FILE      = Path(os.getenv("SMTP_FILE") or "/data/smtp.json")
+SMTP_FILE          = Path(os.getenv("SMTP_FILE") or "/data/smtp.json")
+RATE_BUCKETS_FILE  = Path(os.getenv("RATE_BUCKETS_FILE") or "/data/rate_buckets.json")
+MAX_LEADS_FILE_MB  = int(os.getenv("MAX_LEADS_FILE_MB", "10"))
 
-# Rate limiting for /lead: max N requests per IP per window (seconds).
+# Rate limiting for /lead and /cookie-consent: max N requests per IP per window (seconds).
 # Set LEAD_RATE_LIMIT=0 to disable.
 LEAD_RATE_LIMIT  = int(os.getenv("LEAD_RATE_LIMIT", "5"))
 LEAD_RATE_WINDOW = int(os.getenv("LEAD_RATE_WINDOW", "60"))
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 
+def _load_rate_buckets():
+    """Restore rate bucket state from disk on startup to survive container restarts."""
+    if not RATE_BUCKETS_FILE.exists():
+        return
+    try:
+        data = json.loads(RATE_BUCKETS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            cutoff = time.time() - LEAD_RATE_WINDOW
+            for ip, timestamps in data.items():
+                if isinstance(timestamps, list):
+                    valid = [t for t in timestamps if isinstance(t, (int, float)) and t > cutoff]
+                    if valid:
+                        _rate_buckets[ip] = valid
+    except Exception:
+        pass
+
+_load_rate_buckets()
+
 def _check_rate_limit(ip: str) -> bool:
     if LEAD_RATE_LIMIT <= 0:
         return True
-    now = time.monotonic()
+    now = time.time()
     cutoff = now - LEAD_RATE_WINDOW
     bucket = _rate_buckets[ip]
     _rate_buckets[ip] = [t for t in bucket if t > cutoff]
@@ -107,6 +127,16 @@ def _check_rate_limit(ip: str) -> bool:
         return False
     _rate_buckets[ip].append(now)
     return True
+
+def _rotate_if_needed(path: Path):
+    """Rename path → path.1 when file exceeds MAX_LEADS_FILE_MB to prevent unbounded growth."""
+    if MAX_LEADS_FILE_MB <= 0:
+        return
+    try:
+        if path.exists() and path.stat().st_size > MAX_LEADS_FILE_MB * 1024 * 1024:
+            path.rename(path.with_suffix(path.suffix + ".1"))
+    except Exception as exc:
+        print(f"file rotation error {path}: {exc}", flush=True)
 
 def _build_smtp_cfg() -> dict:
     """Load SMTP config: smtp.json overrides env."""
@@ -1144,6 +1174,7 @@ async def lead_handler(request: web.Request):
 
     try:
         LEADS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_needed(LEADS_FILE)
         with LEADS_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(lead, ensure_ascii=False) + "\n")
     except Exception as exc:
@@ -1189,6 +1220,9 @@ async def notify_handler(request: web.Request):
 
 async def cookie_consent_handler(request: web.Request):
     """Accepts cookie consent events — saves to file, returns 200. No notifications."""
+    ip = request.headers.get("X-Real-IP", request.remote or "")
+    if not _check_rate_limit(ip):
+        return web.json_response({"ok": False, "error": "rate_limited"}, status=429)
     try:
         payload = await request.json()
     except Exception:
@@ -1208,6 +1242,7 @@ async def cookie_consent_handler(request: web.Request):
     consents_file = LEADS_FILE.parent / "cookie_consents.jsonl"
     try:
         consents_file.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_needed(consents_file)
         with consents_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as exc:
@@ -1224,8 +1259,26 @@ async def health_handler(_: web.Request):
 
 # ───────────── app lifecycle ─────────────
 
+async def _rate_buckets_maintenance():
+    """Every 60s: evict stale IPs from memory and persist buckets to disk."""
+    while True:
+        await asyncio.sleep(60)
+        cutoff = time.time() - LEAD_RATE_WINDOW
+        stale = [ip for ip, ts in list(_rate_buckets.items()) if not any(t > cutoff for t in ts)]
+        for ip in stale:
+            del _rate_buckets[ip]
+        try:
+            RATE_BUCKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            RATE_BUCKETS_FILE.write_text(
+                json.dumps(dict(_rate_buckets), ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"rate buckets save error: {exc}", flush=True)
+
 async def on_startup(_: web.Application):
     global _polling_task
+    asyncio.create_task(_rate_buckets_maintenance())
     if not bot:
         return
     # Start polling first (delete_webhook is handled inside polling_loop with retry),
